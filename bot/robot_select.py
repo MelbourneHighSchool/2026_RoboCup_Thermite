@@ -5,7 +5,7 @@ docstrings/comments - crop_top/crop_bottom/crop_left, exclusion_inner_frac/
 exclusion_outer_frac, cam_bearing_offset_deg and handle_exclusion_deg on
 bot.vision (and handle_exclusion_deg also on bot.debug_server), base_speed/
 rush_speed on bot.controllers and bot.motion, wall_slide_zone_mm on
-bot.motion).
+bot.motion, DEFAULT_ROLE on bot.main's startup role pre-pick).
 
 A single reusable function so this doesn't get duplicated between the real
 entry point (bot/main.py) and the mainrunbot1.py/mainrunbot2.py shims: all

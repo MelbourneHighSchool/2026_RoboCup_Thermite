@@ -46,7 +46,7 @@ from bot.robot_select import select_and_publish_config
 
 # ROBOT_ID selects bot1_config/bot2_config and publishes every per-bot
 # constant gap (crop/exclusion/bearing geometry, drive speeds, wall-slide
-# zone, handle exclusion, motor pins, ALWAYS_ATTACKER) onto the modules that
+# zone, handle exclusion, motor pins, DEFAULT_ROLE) onto the modules that
 # reference them, before any thread starts or any function that could need
 # them gets called. sys.exit()s loudly if ROBOT_ID isn't "1" or "2" - never
 # silently default, wrong motor pins would drive the wrong physical robot.
@@ -423,19 +423,20 @@ def main():
     # Uncomment alongside the matching Button() line above once fitted:
     # button_calib.when_pressed    = select_calib
 
-    # ALWAYS_ATTACKER (per-bot, see bot1_config.py/bot2_config.py): this bot
-    # pre-picks the striker role at startup, reproducing bot2's original
-    # _select_role("striker") pre-pick - only the goal-colour button is then
-    # needed to start play (the role buttons still work afterward, e.g. to
-    # switch to goalie by hand). bot1 leaves slot_role unset and waits for
-    # both button presses, matching its original wait-for-buttons behaviour.
-    if _bot_cfg.ALWAYS_ATTACKER:
-        select_role("striker")
+    # DEFAULT_ROLE (per-bot, see bot1_config.py/bot2_config.py, published
+    # through bot.robot_select): pre-pick the bot's configured default role at
+    # startup - bot2 pre-picks striker (reproducing its original
+    # _select_role("striker") pre-pick), bot1 pre-picks goalie - so only the
+    # goal-colour button is then needed to start play (the role buttons still
+    # work afterward, e.g. to switch roles by hand).
+    if _bot_cfg.DEFAULT_ROLE is not None:
+        select_role(_bot_cfg.DEFAULT_ROLE)
 
     srcs = "lidar" + ("+imu" if imu_fusion_enabled else "")
     print(f"[main] idle, GPIO {button_blue_pin}/{button_yellow_pin} pick "
           f"the enemy goal colour, {button_attacker_pin}/{button_goalie_pin}"
-          f" pick the role; play starts once both are picked"
+          f" pick the role; default role = {_bot_cfg.DEFAULT_ROLE}; "
+          f"play starts once both are picked"
           f"{'' if network.team_play_enabled else ' (solo)'}; "
           f"localisation = {srcs}; key 5 = camera-only mode, no lidar "
           "(sec 4.9)", flush=True)
