@@ -63,7 +63,8 @@ vmax_full_cmd_mms  = (math.sqrt(2.0) * math.pi * wheel_diameter_mm
 # Motor.drive's own "direction changes instant" design (see its ACCEL/DECEL
 # comment in MotorFuncs_Proto1.py) - this only smooths a sudden jump straight
 # to a big command, it doesn't re-introduce a general drive ramp. At 0.06 per
-# loop / 50Hz, 0 -> rush_speed (0.4) takes about 7 loops (~0.13s) and 0 -> full
+# loop / 50Hz, 0 -> rush_speed (0.5, see bot1_config.py/bot2_config.py) takes
+# about 9 loops (~0.18s) and 0 -> full
 # scale (1.0) about 17 loops (~0.33s): fast enough to stay responsive, slow
 # enough that a sudden full-speed command doesn't ask real wheels for
 # instant torque and skid/tip. overrideAcc bypasses the cap entirely for
@@ -481,7 +482,7 @@ _field_module.goal_flank_keep_mm = goal_flank_keep_mm
 # damp the into-wall component within this band outside the keep line. Must
 # cover one pose-staleness interval (~100ms) of travel at rush_speed, or a
 # fast, close approach can cross keep_min_mm before the guard ever sees it;
-# 400 assumes rush_speed around 0.4, widen further if rush_speed goes up.
+# 400 assumes rush_speed around 0.5, widen further if rush_speed goes up.
 # wall_slide_zone_mm itself is a documented per-bot gap (see module
 # docstring): it is already in bot1_config.py/bot2_config.py, not
 # redefined here, and is referenced only inside function bodies below
@@ -791,18 +792,35 @@ def _lane_clear(rx, ry, hdg, bearing_rel, enemies):
         if 0.0 < ahead <= rush_lookahead_mm and abs(lateral) <= rush_lane_half_width_mm:
             return False
     return True
+# Noise gate on _add_ball_velocity's ball-velocity contribution. A stationary
+# ball's velocity estimate is not zero, it jitters around zero (camera fix
+# quantisation + the estimator's own window), so the old "mix in anything above
+# 1e-6 mm/s" test flipped the lead term in and out every tick a still ball's
+# estimate crossed the threshold - the commanded bearing (and rot_speed, which
+# is drive_angle * turn_gain downstream) snapped side to side with it. Below
+# ball_vel_fade_min_mms the estimate is treated as pure noise and contributes
+# nothing; above ball_vel_fade_full_mms it's a genuinely moving ball and the
+# full velocity is mixed in; between the two the contribution fades in
+# linearly, so a real (slow) roll ramps the lead in smoothly instead of
+# snapping.
+ball_vel_fade_min_mms  = 150.0
+ball_vel_fade_full_mms = 450.0
+
+
 def _add_ball_velocity(drive_deg, cmd, hdg, vbx, vby):
-    """Method 6 command mixing: convert the capture command (robot-frame bearing + command units) to a physical robot-frame velocity, add the ball's field velocity rotated into the robot frame, and convert back."""
+    """Method 6 command mixing: convert the capture command (robot-frame bearing + command units) to a physical robot-frame velocity, add the ball's field velocity rotated into the robot frame, and convert back. The ball-velocity term passes through the ball_vel_fade_* noise gate above (zero below min, full above, linear between) so a jittering near-stationary estimate can't oscillate the capture bearing."""
     v_cap = cmd / max_speed_cmd * vmax_full_cmd_mms
     d_rad = math.radians(drive_deg)
     vx = v_cap * math.sin(d_rad)
     vy = v_cap * math.cos(d_rad)
 
     vb = math.hypot(vbx, vby)
-    if vb > 1e-6:
+    if vb > ball_vel_fade_min_mms:
+        w = min(1.0, (vb - ball_vel_fade_min_mms)
+                / (ball_vel_fade_full_mms - ball_vel_fade_min_mms))
         a_rel = math.atan2(vbx, vby) - math.radians(hdg) # field -> robot
-        vx += vb * math.sin(a_rel)
-        vy += vb * math.cos(a_rel)
+        vx += w * vb * math.sin(a_rel)
+        vy += w * vb * math.cos(a_rel)
 
     v = math.hypot(vx, vy)
     if v < 1e-6:

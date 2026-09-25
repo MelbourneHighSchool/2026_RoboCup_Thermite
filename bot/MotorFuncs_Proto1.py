@@ -250,6 +250,18 @@ class Motor:
                 cls._last_sent[name] = 0
             except Exception:
                 pass
+        # Reset bot.motion's acceleration-slew state too, so the first command
+        # after a stop ramps from 0 instead of springing from wherever the
+        # stale _last_slew_speed happened to be. Imported lazily: importing
+        # bot.motion at module scope would be circular (motion imports Motor
+        # from bot.hardware). A plain name lookup on the module object also
+        # sees any later rebinding of the module global, matching how the
+        # rest of the code reads rebindable globals through their module.
+        try:
+            import bot.motion as _motion
+            _motion._last_slew_speed = 0.0
+        except Exception:
+            pass  # motion not importable (bare-bench scripts) - nothing to reset
     @classmethod
     def clear_faults(cls):
         # call after stopall() on quit so a fault from this run doesn't ignore the next

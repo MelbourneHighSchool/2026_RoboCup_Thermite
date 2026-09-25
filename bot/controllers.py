@@ -118,6 +118,10 @@ has_ball   = "has_ball"
 # ourselves
 passing    = "pass"
 flick_shot = "flick_shot" # spin-release shot around a blocker (sec. 3.22)
+# shared non-blocking dwibbler-reverse countdown entered from both passing and
+# flick_shot (replaces their old time.sleep-in-tick release, which stalled the
+# whole 50Hz control loop for the dwell); also published in _state for logs.
+ejecting   = "ejecting"
 
 # Heading gain, pure P, no D.
 turn_gain = 0.0012
@@ -328,7 +332,13 @@ class GoalieController:
         if jam_cmd is not None:
             drive_rel, spd = jam_cmd
             _set_dwibbler(False)
-            _slew_drive(drive_rel, spd, rot_speed=drive_rel * turn_gain)
+            # overrideAcc=True: the push-through dwell is only jam_hold_s
+            # (0.5s); the slew cap alone would spend most of it still ramping
+            # toward full scale (~0.33s to reach 1.0), neutering the escape.
+            # This is exactly the "emergency wall/enemy pushback" case the
+            # overrideAcc bypass exists for (see motion.py's own comment).
+            _slew_drive(drive_rel, spd, rot_speed=drive_rel * turn_gain,
+                        overrideAcc=True)
             return
 
         # run_mode == "run" guarantees slot_goal is set (_apply_slot_state).
@@ -551,6 +561,12 @@ class StrikerController:
         # same pattern as capture_hold_s: ramps up while deep+contested, drains
         # otherwise, so a brief let-up doesn't instantly disarm it
         self.stuck_hold_s = 0.0
+        # non-blocking dwibbler-eject countdown (state == ejecting): monotonic
+        # deadline and which kind of eject (pass release vs flick abort) is
+        # running, so the reversal can outlive the tick that started it
+        # without ever time.sleep()ing inside the 50Hz control loop.
+        self.eject_until_t = 0.0
+        self.eject_is_pass = True
         self.jam = JamRecovery() # general body-contact stuck detector, see its class docstring
 
     def tick(self):
@@ -650,7 +666,11 @@ class StrikerController:
             if jam_cmd is not None:
                 drive_rel, spd = jam_cmd
                 _set_dwibbler(False)
-                _slew_drive(drive_rel, spd, rot_speed=drive_rel * turn_gain)
+                # overrideAcc=True, same as the goalie's own jam push above:
+                # the 0.5s dwell can't afford the ~0.33s slew ramp to full
+                # scale (see that site's comment).
+                _slew_drive(drive_rel, spd, rot_speed=drive_rel * turn_gain,
+                            overrideAcc=True)
                 return
 
         # run_mode == "run" guarantees slot_goal is set (_apply_slot_state).
@@ -740,7 +760,11 @@ class StrikerController:
                 spd = min(base_speed, _brake_speed_frac(dist_t))
                 drive_rel, spd = _enemy_guard(rx, ry, hdg, drive_rel, spd, enemies)
                 drive_rel, spd = _wall_guard(rx, ry, hdg, drive_rel, spd)
-                Motor.drive(drive_rel, spd, rot_speed=face * turn_gain)
+                # _slew_drive, not Motor.drive: every other drive path here is
+                # slew-capped, and an uncapped escort command jumps 0 ->
+                # base_speed in one tick straight out of a stop (idle/lost
+                # pose), a jerk every other path is protected from.
+                _slew_drive(drive_rel, spd, rot_speed=face * turn_gain)
                 return
 
             if ball is not None:
@@ -1092,7 +1116,13 @@ class StrikerController:
                     lane_open = KnownOcclusion((rx, ry),
                                                blockers).observed(gx, gy)
                     if not lane_open:
-                        self.state = flick_shot
+                        # Straight into the shared non-blocking eject countdown
+                        # (flick mode); the old flick_shot state just slept
+                        # flick_snap_s in-tick, stalling the control loop.
+                        _set_dwibbler(True, speed=-flick_kick_speed)
+                        self.eject_until_t = time.monotonic() + flick_snap_s
+                        self.eject_is_pass = False
+                        self.state         = ejecting
                         print("[main] blocked -> reversing dwibbler "
                              "(no shot attempt yet)", flush=True)
                         return
@@ -1174,25 +1204,40 @@ class StrikerController:
                 _slew_drive(0, 0, rot_speed=rel * turn_gain)
                 return
             # Aligned and settled, release: reverse the dwibbler briefly.
+            # time.sleep would stall the whole 50Hz control loop for
+            # pass_eject_s (0.25s, 12+ dead ticks holding a spin-in-place),
+            # so instead stage the eject as a countdown: the dwibbler stays
+            # reversed until the deadline, then the next tick cleans up and
+            # hands back to seek. Same shape as any other per-tick state.
             _set_dwibbler(True, speed=-pass_eject_speed)
-            time.sleep(pass_eject_s)
-            _set_dwibbler(False)
-            self.state         = seek
-            self.pass_hold_s   = 0.0
-            self.pass_expiry_t = time.monotonic() + pass_target_max_age_s
+            self.eject_until_t    = time.monotonic() + pass_eject_s
+            self.eject_is_pass    = True
+            self.pass_hold_s      = 0.0
+            self.pass_expiry_t    = time.monotonic() + pass_target_max_age_s
             _possession.reset()
+            self.state            = ejecting
             print("[main] pass released", flush=True)
 
-        # flick_shot is not the wind-up/snap spin-release yet, that wind-up turn could stick indefinitely, so this state is just the release half: reverse the dwibbler briefly and let go.
-        elif self.state == flick_shot:
-            _set_dwibbler(True, speed=-flick_kick_speed)
-            time.sleep(flick_snap_s)
+        # ejecting: pass/flick dwibbler-reverse countdown, one shared state
+        # (see the passing/flick_shot release sites above/below) - runs the
+        # reversal for its full dwell without ever blocking the control loop,
+        # then transitions back to seek.
+        elif self.state == ejecting:
+            if time.monotonic() < self.eject_until_t:
+                _set_dwibbler(True,
+                              speed=-(pass_eject_speed if self.eject_is_pass
+                                      else flick_kick_speed))
+                # Hold still-ish while ejecting; a spin-in-place would fight
+                # the ball leaving the mouth.
+                _slew_drive(0, 0)
+                return
             _set_dwibbler(False)
+            if not self.eject_is_pass:
+                _possession.reset()
+                self.possession_seen = False
+                print("[main] dwibbler reversed (no shot attempt) -> seeking",
+                      flush=True)
             self.state = seek
-            _possession.reset()
-            self.possession_seen = False
-            print("[main] dwibbler reversed (no shot attempt) -> seeking",
-                 flush=True)
 
         # shoot: align to the enemy goal and kick (solenoid)
         # elif self.state == shoot:             # <- enable with solenoid
