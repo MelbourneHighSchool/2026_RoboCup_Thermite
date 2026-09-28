@@ -240,7 +240,7 @@ class PowerfulBLDCDriver:
         self._i2c_device.readinto(self._receive_buffer, end=9)
         self.calibration_state = self._unpack_uint8(0)
         self.ELECANGLEOFFSET = self._unpack_uint32(1)
-        self.SINCOSCENTRE = self._unpack_uint32(5)
+        self.SINCOSCENTRE = self._unpack_int32(5)
         if self.calibration_state == 255:
             return True
         return False
@@ -251,7 +251,7 @@ class PowerfulBLDCDriver:
         self._i2c_device.readinto(self._receive_buffer, end=9)
         self.calibration_state = self._unpack_uint8(0)
         self.ELECANGLEOFFSET = self._unpack_uint32(1)
-        self.SINCOSCENTRE = self._unpack_uint32(5)
+        self.SINCOSCENTRE = self._unpack_int32(5)
         if self.calibration_state == 255:
             return self.ELECANGLEOFFSET
         return 0
@@ -262,15 +262,23 @@ class PowerfulBLDCDriver:
         self._i2c_device.readinto(self._receive_buffer, end=9)
         self.calibration_state = self._unpack_uint8(0)
         self.ELECANGLEOFFSET = self._unpack_uint32(1)
-        self.SINCOSCENTRE = self._unpack_uint32(5)
+        self.SINCOSCENTRE = self._unpack_int32(5)
         if self.calibration_state == 255:
             return self.SINCOSCENTRE
-        return False
+        return 0
 
     def update_quick_data_readout(self) -> None:
+        """refresh the cached Quick Data Readout: one 10-byte read with no command byte, as the
+        vendor driver does.
+
+        Position is unsigned and speed signed, the vendor's layout. Position is a 32-bit
+        counter, so consumers diff it modulo 2^32 (see odometry._qdr_step). Only format 0
+        exists on the wire: setQuickDataReadoutFormat is declared in the vendor header but
+        never defined.
+        """
         if self.QDRformat == 0:
             self._i2c_device.readinto(self._receive_buffer, end=10)
-            self.QDRposition = self._unpack_int32(0)
+            self.QDRposition = self._unpack_uint32(0)
             self.QDRspeed = self._unpack_int32(4)
             self.QDRERROR1 = self._unpack_uint8(8)
             self.QDRERROR2 = self._unpack_uint8(9)

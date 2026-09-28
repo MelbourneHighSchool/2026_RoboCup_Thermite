@@ -1,9 +1,9 @@
-"""Parity + benchmark for camera_native against the real OpenCV pipeline
-(cv2.remap + cv2.cvtColor + cv2.inRange, bot/vision.py's own detect_ball_warp
-preamble). NOT wired into bot/ - see this dir's own README note:
-measured slower than OpenCV's own pipeline even with -march=native
--ffast-math -fopenmp, kept here only as a documented, tested "tried this,
-didn't pay off" artifact. Run from the repo root: `python3 native/test_camera_native.py`."""
+"""Parity + benchmark for camera_native against the real OpenCV pipeline (cv2.remap +
+cv2.cvtColor + cv2.inRange, bot/vision.py's detect_ball_warp preamble). Not wired into
+bot/ - see this dir's README note: measured slower than OpenCV's pipeline even with
+-march=native -ffast-math -fopenmp, kept here only as a documented, tested "tried this,
+didn't pay off" artifact. Run from the repo root: `python3 native/test_camera_native.py`.
+"""
 import sys
 import time
 
@@ -49,9 +49,9 @@ def test_mask_parity(n_trials=15):
 
     rate = total_mismatch / total_px
     print(f"mask parity: {total_mismatch}/{total_px} mismatched pixels ({rate:.4%}) "
-          f"across {n_trials} randomized trials - expected: a small residual from "
+          f"across {n_trials} randomized trials. Expected: a small residual from "
           f"+-1 rounding landing exactly on a threshold boundary, not a real bug "
-          f"(confirmed by inspection, see this module's own header comment).")
+          f"(confirmed by inspection, see this module's header comment).")
     assert rate < 0.001, f"mismatch rate {rate:.4%} higher than expected"
 
 
@@ -79,9 +79,9 @@ def bench():
     t2 = time.perf_counter()
     py_t, cpp_t = t1 - t0, t2 - t1
     print(f"opencv pipeline: {py_t/N*1000:.3f} ms/call")
-    print(f"fused cpp:       {cpp_t/N*1000:.3f} ms/call")
-    print(f"ratio: {cpp_t/py_t:.1f}x SLOWER than OpenCV's own pipeline "
-          f"(this is the expected, documented result - see header comment)")
+    print(f"fused cpp: {cpp_t/N*1000:.3f} ms/call")
+    print(f"ratio: {cpp_t/py_t:.1f}x slower than OpenCV's pipeline "
+          f"(the expected, documented result; see the header comment)")
 
 
 if __name__ == "__main__":

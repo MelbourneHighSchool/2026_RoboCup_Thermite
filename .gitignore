@@ -1,3 +1,6 @@
-# Python bytecode caches - never commit interpreter state
 __pycache__/
 *.py[cod]
+*.so
+logs/
+motor_calibration.json
+calib_points.json

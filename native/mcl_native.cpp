@@ -1,13 +1,10 @@
-// mcl_native.cpp - C++ port of bot/localisation.py's MCL heavy numeric core
-// (motion update, likelihood-field sensor weighting, resampling). The
-// Python class (bot.localisation.MCL) keeps orchestration, RNG seeding
-// strategy, the IMU soft prior, and the global-search jitter schedule -
-// only the per-tick number-crunching (the part that scales with
-// n_particles x n_scan_points x n_wall_segments) is ported here, same
-// "port the hot loop, not the whole subsystem" approach as
-// lidar_native.cpp. Falls back to the pure-numpy implementation
-// (byte-for-byte parity tested, see native/test_mcl_native.py) if this
-// extension isn't built.
+// mcl_native.cpp: compiled version of the heavy maths in bot/localisation.py's
+// MCL (motion update, likelihood-field weighting, resampling). The Python
+// class keeps everything else: orchestration, RNG seeding, the IMU heading
+// prior and the global-search jitter. Only the per-tick work that scales
+// with particles x scan points x wall segments lives here, the same split
+// as lidar_native.cpp. If this isn't built, MCL falls back to numpy
+// (parity tested in native/test_mcl_native.py).
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <cmath>
@@ -17,7 +14,7 @@
 namespace py = pybind11;
 
 // One nearest-wall-segment distance, matching FieldModel.
-// closest_point_on_segment / nearest_wall_batch's own point-to-segment
+// closest_point_on_segment / nearest_wall_batch's point-to-segment
 // projection exactly (clamp t to [0,1], distance to the clamped point).
 static inline double nearest_wall_dist(double px, double py,
                                        const std::vector<double> &seg_ax,
@@ -42,8 +39,8 @@ static inline double nearest_wall_dist(double px, double py,
 }
 
 // Motion update, in place: particles is (N,3) [x, y, theta_deg], each
-// particle's own robot-frame (fwd, right) sample rotated into ITS OWN
-// heading (see bot/localisation.py's own comment on _motion_update for why
+// particle's robot-frame (fwd, right) sample rotated into its own
+// heading (see bot/localisation.py's comment on _motion_update for why
 // per-particle, not one shared rotation). Field-clips x/y same as the
 // Python version.
 static void motion_update(py::array_t<double> particles,
@@ -81,10 +78,10 @@ static void motion_update(py::array_t<double> particles,
 // Likelihood-field sensor weights: for each particle, transform every
 // scan point (robot-frame) into field-frame using that particle's own
 // pose, look up nearest-wall distance, and weight by a Gaussian on the
-// mean squared distance (clamped) - matches bot/localisation.py's own
+// mean squared distance (clamped). Matches bot/localisation.py's own
 // _sensor_weights exactly, minus the IMU-prior multiply (still applied
 // in Python afterward, on the returned array, since it's cheap and
-// keeps the prior's own logic in one place).
+// keeps the prior's logic in one place).
 static py::array_t<double> sensor_weights(
         py::array_t<double> particles,
         py::array_t<double> points_local,

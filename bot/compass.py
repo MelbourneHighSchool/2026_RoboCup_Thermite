@@ -1,15 +1,8 @@
-"""BNO08x IMU: heading-delta assist + linear-accel collision gate (sec
-3.18/3.18a). Lidar ICP stays the source of truth for (x, y, heading); the
-IMU fills the gap when lidar is weakest (shoved, fast spins, re-search).
-On-chip game rotation vector for heading only (no magnetometer, pure
-noise next to 4 BLDCs). No hardware -> lidar-only, collision gate never
-trips. imu.py (repo root) is an unrelated standalone bench script, not
-used here.
+"""BNO08x IMU: heading-delta assist and linear-accel collision gate.
 
-Extracted verbatim from mainrunbot1.py's Compass class + IMU-fusion
-helpers + _compass_thread (which lives much further down the monolith,
-near the field-calibration section, but is gathered here since it is the
-thread that owns this module's state).
+Lidar stays the source of truth for (x, y, heading); the IMU fills the gaps where lidar is
+weakest (shoves, fast spins, re-search). Game rotation vector only, no magnetometer (pure
+noise next to four BLDCs). No IMU fitted -> lidar-only, and the collision gate never trips.
 """
 
 import collections
@@ -22,10 +15,12 @@ from bot.diagnostics import imu_fault_hold_s, _mark_health_t, _report_health
 
 
 class Compass:
-    """wraps a BNO08x IMU for the heading-delta assist and collision-accel gate described above."""
+    """wraps a BNO08x for the heading assist and the collision gate."""
 
     def __init__(self, address=0x4A):
-        """connect to the BNO08x at `address` and enable the game rotation vector and linear acceleration reports."""
+        """connect to the BNO08x at `address` and enable game rotation + linear acceleration
+        reports.
+        """
         import board
         from adafruit_bno08x.i2c import BNO08X_I2C
         from adafruit_bno08x import (BNO_REPORT_GAME_ROTATION_VECTOR,
@@ -51,31 +46,40 @@ class Compass:
             return None
 
     def read(self):
-        """current yaw in degrees, clockwise-positive to match the robot's compass convention (pose heading: 0 deg = +y, cw+)."""
+        """current yaw in degrees, clockwise-positive to match pose heading (0 deg = +y, cw+)."""
         x, y, z, w = self.bno.game_quaternion
         yaw = math.degrees(math.atan2(2.0 * (w * z + x * y),
                                       1.0 - 2.0 * (y * y + z * z)))
         return -yaw # BNO yaw is ccw+; robot frame is cw+
 
     def read_accel(self):
-        """linear acceleration magnitude, m/s^2, gravity already removed by the chip's own fusion, see COLLISION_ACCEL_G."""
+        """linear acceleration magnitude, m/s^2, gravity already removed by the chip."""
         ax, ay, az = self.bno.linear_acceleration
         return math.sqrt(ax * ax + ay * ay + az * az)
 
-# Fold the IMU's heading delta into the lidar ICP prior each scan.  The
-# BNO08x is confirmed working on the robot, so fusion is live; the compass
-# thread still publishes _state["imu_heading"] for telemetry either way.
+# Fold the IMU heading delta into each scan's localisation prior. The compass thread
+# publishes imu_heading for telemetry either way.
 imu_fusion_enabled = True
 
-# Timestamped heading history, written by _compass_thread at about 100 Hz and read by the lidar thread to deskew a scan (see _deskew).
+# Timestamped heading history (about 100 Hz), read by the lidar thread to deskew a scan.
 imu_hist_s = 1.0
-_imu_hist  = collections.deque() # (monotonic_t, heading_deg), under _lock
+_imu_hist = collections.deque() # (monotonic_t, heading_deg), under _lock
+# A query up to this far past the newest sample reads that sample. The lidar thread asks
+# for the turn up to a scan's timestamp, usually within a millisecond of it and before
+# the next 100 Hz sample exists; without the hold the deskew almost always fell back to
+# the carried estimate instead of the IMU.
+imu_hist_hold_s = 0.02
 
 
 def _imu_heading_at(t):
-    """IMU heading (deg) at monotonic time `t`, linearly interpolated between samples, or None if the history does not span it."""
-    if len(_imu_hist) < 2 or not (_imu_hist[0][0] <= t <= _imu_hist[-1][0]):
+    """IMU heading (deg) at monotonic time `t`, interpolated, or None if the history doesn't
+    span it (allowing imu_hist_hold_s past the newest sample).
+    """
+    if len(_imu_hist) < 2 or t < _imu_hist[0][0]:
         return None
+    newest_t, newest_h = _imu_hist[-1]
+    if t > newest_t:
+        return newest_h if t - newest_t <= imu_hist_hold_s else None
     prev_t, prev_h = _imu_hist[0]
     for cur_t, cur_h in _imu_hist:
         if cur_t >= t:
@@ -83,16 +87,17 @@ def _imu_heading_at(t):
             if span <= 1e-9:
                 return cur_h
             f = (t - prev_t) / span
-            # Interpolate along the short way round, so a sample pair either
-            # side of the +-180 wrap doesn't read as a near-full turn.
+            # the short way round, so a pair either side of +-180 doesn't read
+            # as a near-full turn
             return prev_h + f * _wrap_deg(cur_h - prev_h)
         prev_t, prev_h = cur_t, cur_h
     return prev_h
 
 
-# Carrying the heading between lidar revolutions: pose updates at about 10 Hz but the control loop runs at 50 Hz, and that staleness caps turn_gain (sec 3.1).
+# Pose updates at about 10 Hz but the control loop runs at 50 Hz, so controllers carry the
+# heading forward with the IMU between revolutions.
 heading_imu_carry = True # off -> controllers steer on the raw lidar pose
-# a bigger delta than this means a stale reference, not a turn; fall back to the pose
+# a bigger delta than this means a stale baseline, not a turn: fall back to the pose
 heading_carry_max_deg = 90.0
 
 
@@ -108,7 +113,7 @@ def _fused_heading(pose, pose_imu, imu_now):
 
 
 def _imu_turn_between(t0, t1):
-    """how far the robot actually turned (deg, cw+) between two monotonic times, from the IMU history, or None if it doesn't cover the window."""
+    """how far the robot turned (deg, cw+) between two monotonic times, or None if not covered."""
     with state._lock:
         h0 = _imu_heading_at(t0)
         h1 = _imu_heading_at(t1)
@@ -117,17 +122,22 @@ def _imu_turn_between(t0, t1):
     return _wrap_deg(h1 - h0)
 
 
-# BNO08x linear-accel magnitude past this is a shove/wall hit, not commanded driving. Motor.drive
-# has no software accel/decel ramp any more (removed so direction changes are instant, not eased),
-# so a hard commanded cut can genuinely swing real IMU-measured accel much higher than the old
-# ramp's ~4.5g worst case - this is raised well above that with margin as an unverified guess,
-# NEEDS bench/field retuning against real IMU logs of a deliberate hard direction change before
-# trusting it not to false-trigger on ordinary play.
-COLLISION_ACCEL_G  = 14.0
+# Linear accel past this is a shove or wall hit, not driving. Motor.drive has no accel
+# ramp, so a hard commanded direction change can spike well past the old ~4.5 g; 14 g is
+# an unverified guess with margin. Retune against IMU logs of a deliberate hard reversal
+# before trusting it.
+COLLISION_ACCEL_G = 14.0
 
 
 def _compass_thread():
-    """poll the BNO08x at about 100 Hz into _state["imu_heading"] (relative yaw, deg cw+) and _state["collision_t"] (see COLLISION_ACCEL_G). Also owns the IMU health/fault latch (see imu_fault_hold_s / "imu_fault" / "imu_pause_latched" in _state): a lone transient bus-read exception (the try/except right below) just holds the last good value as always, but if NO good reading comes back for imu_fault_hold_s straight - a sustained fault, e.g. the sensor genuinely dropping off the bus mid-match - that's escalated into a forced-stop latch _play_loop enforces, not silently held forever. A robot that never had a BNO08x at all (c is None) is a normal, already-supported lidar-only configuration, not a fault: it never enters this loop, so it can never latch a pause."""
+    """poll the BNO08x at about 100 Hz into imu_heading and collision_t, and own the IMU fault
+    latch.
+
+    A lone bad read just holds the last value. No good reading for imu_fault_hold_s straight
+    (the sensor dropping off the bus mid-match) sets imu_fault and the imu_pause_latched
+    forced stop. A robot with no BNO08x at all is a normal lidar-only setup: it never enters
+    the loop, so it never latches.
+    """
     c = Compass.try_init(0x4A) or Compass.try_init(0x4B) # SA0 low or high
     if c is None:
         _report_health("imu", "disabled (no BNO08x)")
@@ -143,7 +153,8 @@ def _compass_thread():
         if h is not None:
             with state._lock:
                 state._state["imu_heading"] = h
-                # Timestamped history, for deskewing a lidar revolution against the rotation that actually happened during it (see _imu_turn_between).
+                # history for deskewing a revolution against the rotation
+                # that actually happened during it
                 _imu_hist.append((now, h))
                 while _imu_hist and now - _imu_hist[0][0] > imu_hist_s:
                     _imu_hist.popleft()
@@ -160,5 +171,5 @@ def _compass_thread():
             state._state["imu_fault"] = faulted
             if faulted:
                 state._state["imu_pause_latched"] = True
-        _report_health("imu", "FAULT (no reading)" if faulted else "ok")
+        _report_health("imu", "fault (no reading)" if faulted else "ok")
         time.sleep(0.01)

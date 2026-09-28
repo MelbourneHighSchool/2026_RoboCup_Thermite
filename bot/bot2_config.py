@@ -1,29 +1,18 @@
-"""Per-bot constants for bot2 (mainrunbot2.py), extracted from the
-mainrunbot1.py/mainrunbot2.py diff.
+"""Per-bot constants for bot2."""
 
-Pure leaf module: no imports from anything in bot.*. The calibset([...])
-payload arrays are shared hardware-SKU constants, not per-bot, and belong
-in a later stage's bot/hardware.py, not here.
-"""
-
-# 5.5deg: each handle's apparent width works out to about 2.5deg (handle size/mount offset), rounded up with margin.
+# Each handle reads about 2.5 deg wide at this mount; 5.5 leaves margin.
 handle_exclusion_deg = 5.5
 
-base_speed     = 0.2 # normal open-field driving; see wall_safe_speed_cmd
-rush_speed     = 0.5
-
-# damp the into-wall component within this band outside the keep line
-wall_slide_zone_mm   = 200.0
-
-# Carried over from the old 180-rotation pipeline's own crop, transposed through the extra 90CW this mount needs.
-crop_top    = 455
+# Crop carried over from the old 180-degree pipeline, transposed through this mount's
+# extra 90 CW.
+crop_top = 455
 crop_bottom = 432
-crop_left   = 52
+crop_left = 52
 
 exclusion_inner_frac = 0.54 # inner 54% of radius ignored (robot body)
 exclusion_outer_frac = 1.03 # detections past 103% of radius ignored (field clutter)
 
-# Not yet bench-checked on this bot (ball at the physical mouth should read 0); happens to match mainrunbot1.py's current value but isn't verified either way.
+# Not bench-checked on this bot yet: a ball at the mouth should read 0.
 cam_bearing_offset_deg = 0.0
 
 MOTOR_PINS = {
@@ -34,5 +23,5 @@ MOTOR_PINS = {
     "dwibble": 27,
 }
 
-# bot2_config.py
+# Bot 2 attacks by default; the role buttons can still switch it later.
 DEFAULT_ROLE = "striker"

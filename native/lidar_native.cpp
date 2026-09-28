@@ -1,14 +1,13 @@
-// lidar_native.cpp - C++ port of LidarReader._crc8/_parse_packet
-// (bot/lidar.py). Per-packet CRC8 + 12-point unpack, called on every raw
-// packet off the serial stream (far more often than the ~10Hz revolution
-// rate), so this is the hottest, smallest loop in the whole pipeline -
-// see the repo README sec 3.24 for why this was picked first.
+// lidar_native.cpp: compiled C++ core for LidarReader._crc8 and
+// _parse_packet (bot/lidar.py). The CRC8 check and 12-point unpack run on
+// every raw packet off the serial port, far more often than the ~10 Hz
+// revolution rate, which makes this the hottest small loop in the
+// pipeline and the first one worth moving.
 //
-// Byte-for-byte port of the Python reference: same header bytes (0x54,
-// 0x2C), same CRC8 table/algorithm, same field offsets/struct layout
-// (little-endian), same angle-wrap and step-interpolation arithmetic.
-// Verified against bot/lidar.py's own LidarReader._parse_packet output on
-// both synthetic and randomized packets (see native/test_lidar_native.py).
+// It matches the Python byte for byte: same header bytes (0x54, 0x2C),
+// same CRC8 table, same little-endian field offsets, same angle wrap and
+// step interpolation. native/test_lidar_native.py checks it against
+// LidarReader._parse_packet on synthetic and random packets.
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <cmath>
@@ -50,7 +49,7 @@ static uint8_t crc8(const uint8_t *data, size_t len) {
     return crc;
 }
 
-// exposed for parity testing against LidarReader._crc8's own table lookup.
+// exposed for parity testing against LidarReader._crc8's table lookup.
 static uint8_t py_crc8(py::bytes data) {
     std::string s = data;
     return crc8(reinterpret_cast<const uint8_t *>(s.data()), s.size());
@@ -64,8 +63,8 @@ static inline uint16_t rd_u16(const uint8_t *p) {
 // (angle_deg, distance_mm, intensity) tuples, matching LidarReader.
 // _parse_packet's own (points, speed_dps) shape (LidarPoint objects are
 // constructed on the Python side from these tuples, see the wrapper in
-// bot/lidar.py's own LidarReader.read_scans once wired in) - or
-// (None, None) on a bad header/CRC/length, same as the Python original.
+// bot/lidar.py's LidarReader.read_scans once wired in), or
+// (None, None) on a bad header/CRC/length, same as the Python version.
 static py::object parse_packet(py::bytes buf_obj) {
     std::string buf = buf_obj;
     if (buf.size() != static_cast<size_t>(PACKET_LEN)) {
@@ -104,7 +103,7 @@ static py::object parse_packet(py::bytes buf_obj) {
 }
 
 PYBIND11_MODULE(lidar_native, m) {
-    m.doc() = "C++ port of LidarReader._crc8/_parse_packet (bot/lidar.py) "
+    m.doc() = "compiled C++ core for LidarReader._crc8/_parse_packet (bot/lidar.py) "
               "- see this file's own header comment.";
     m.def("crc8", &py_crc8, "CRC8 of a byte buffer, same table/algorithm as LidarReader._crc8.");
     m.def("parse_packet", &parse_packet,

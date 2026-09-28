@@ -3,19 +3,15 @@
 # always builds into native/ next to this script.
 #
 # Deps: g++ (C++17), pybind11 (`pip3 install pybind11`), numpy.
-# On the Pi, use `-march=native` too (already in this script) - it
-# targets whatever CPU actually builds it, so build ON the Pi, don't
-# cross-compile/copy a .so built elsewhere.
+# The script builds with `-march=native`, which targets whatever CPU runs
+# the build, so build on the Pi itself rather than copying a .so over.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
 PY=${PYTHON:-python3}
-# Derive everything from $PY itself via sysconfig, not a separate
-# python3-config binary - on a machine with more than one Python install
-# (seen while developing this), `python3-config` can silently point at a
-# DIFFERENT interpreter/ABI than `python3` itself, building a .so this
-# exact `python3` can't import. sysconfig always matches the interpreter
-# that ran it.
+# Take the paths from $PY's own sysconfig rather than python3-config. With
+# more than one Python installed, python3-config can point at a different
+# interpreter and build a .so that this python3 can't import.
 PB_INC=$("$PY" -c "import pybind11; print(pybind11.get_include())")
 NP_INC=$("$PY" -c "import numpy; print(numpy.get_include())")
 PY_INC=$("$PY" -c "import sysconfig; print('-I' + sysconfig.get_path('include'))")
@@ -30,6 +26,6 @@ build() {
 
 build lidar_native
 build mcl_native
-build camera_native   # kept for the record, see this dir's own README note - not wired into bot/
+build camera_native # kept but not wired into bot/ (slower than OpenCV)
 
 echo "done: $(ls -- *"$EXT" 2>/dev/null | tr '\n' ' ')"

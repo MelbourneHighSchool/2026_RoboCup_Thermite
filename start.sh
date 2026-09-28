@@ -1,21 +1,21 @@
 #!/bin/bash
-# start.sh: boot entrypoint. The systemd unit
-# (bot/systemd/lidar-robot.service) sets ROBOT_ID, this script activates the
-# venv, then hands off to the packaged entrypoint bot/main.py - no button,
-# plays as soon as the mode/role buttons are pressed (sec 1).
-#
-# Assumes this repo is at ~/Stuff and the venv at ~/env. If either lives
-# elsewhere on your Pi, edit STUFF_DIR and VENV_DIR below.
-set -e
+# Boot entry point. The service supplies ROBOT_ID; direct runs must set it,
+# for example: ROBOT_ID=1 ./start.sh.
+set -euo pipefail
 
-STUFF_DIR="$HOME/Stuff"
-VENV_DIR="$HOME/env"
+REPO_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+VENV_DIR="${VENV_DIR:-$HOME/env}"
 
-if [ -z "$ROBOT_ID" ]; then
-    echo "ROBOT_ID not set (systemd unit should set it) - refusing to guess" >&2
+if [ ! -f "$VENV_DIR/bin/activate" ]; then
+    echo "Virtual environment not found at $VENV_DIR" >&2
+    exit 1
+fi
+
+if [ "${ROBOT_ID:-}" != "1" ] && [ "${ROBOT_ID:-}" != "2" ]; then
+    echo "Set ROBOT_ID to 1 or 2 before starting the robot." >&2
     exit 1
 fi
 
 source "$VENV_DIR/bin/activate"
-cd "$STUFF_DIR"
-exec python -m bot.main
+cd "$REPO_DIR"
+exec python3 -m bot.main "$@"

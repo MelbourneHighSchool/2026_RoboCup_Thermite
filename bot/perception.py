@@ -1,16 +1,4 @@
-"""Localisation (ICP against FieldModel) and lidar-based robot detection.
-
-Perception.localise/global_localise fit the live pose to the known field
-geometry (point-to-line ICP against FieldModel.nearest_wall_batch), and
-Perception.detect_robots turns whatever scan points ICP called outliers into
-candidate enemy/teammate bodies (occlusion-gated cluster + fixed-radius
-circle fit).
-
-fit_circle_algebraic lives in bot.tracking, not here: its one caller
-(EnemyProfile.observe) is a tracking concept (per-enemy shape profiling
-across scans), not a per-scan localisation/detection step, and it has no
-other caller in this module.
-"""
+"""Point-to-line ICP against FieldModel, and lidar-based robot detection."""
 
 import math
 
@@ -24,29 +12,29 @@ class Perception:
 
     # localisation tuning
     inlier_threshold_mm = 120.0 # max wall-distance to count as an inlier
-    max_iters           = 8 # ICP iterations per call
-    converge_mm         = 1.0 # stop early if translation delta < this
+    max_iters = 8 # ICP iterations per call
+    converge_mm = 1.0 # stop early if translation delta < this
 
     # object detection tuning
-    robot_radius_mm      = 105.0 # about 210 mm diameter robots
-    max_robots_on_field  = 3 # other bots visible to us (1-3 by rule)
-    cluster_gap_mm       = 150.0 # max gap between consecutive cluster points
-    depth_split_mm       = 120.0 # range jump that splits a cluster
+    robot_radius_mm = 105.0 # about 210 mm diameter robots
+    max_robots_on_field = 3 # other bots visible to us (1-3 by rule)
+    cluster_gap_mm = 150.0 # max gap between consecutive cluster points
+    depth_split_mm = 120.0 # range jump that splits a cluster
     # object must sit this far in front of the wall its ray would otherwise hit
-    occlude_margin_mm    = 140.0
-    min_span_mm          = 35.0 # clusters narrower than this are noise
-    max_cluster_span_mm  = 280.0 # clusters wider than this get split
+    occlude_margin_mm = 140.0
+    min_span_mm = 35.0 # clusters narrower than this are noise
+    max_cluster_span_mm = 280.0 # clusters wider than this get split
     # candidates this close are the same bot (an arc chopped by dropouts/occlusion)
-    dup_merge_mm         = 170.0
-    circle_resid_max_mm  = 45.0 # max circle-fit RMS for a valid robot
-    field_margin_mm      = 60.0 # robot centres must be this far in-field
-    scan_step_rad        = math.radians(0.9) # LiDAR angular step (about LD19)
+    dup_merge_mm = 170.0
+    circle_resid_max_mm = 45.0 # max circle-fit RMS for a valid robot
+    field_margin_mm = 60.0 # robot centres must be this far in-field
+    scan_step_rad = math.radians(0.9) # LiDAR angular step (about LD19)
 
     # coordinate transform
     @staticmethod
     def transform(points_local, X, Y, H_deg):
         """convert a list of robot-frame (xl, yl) pairs to field-frame."""
-        h    = math.radians(H_deg)
+        h = math.radians(H_deg)
         c, s = math.cos(h), math.sin(h)
         return [(X + xl * c + yl * s,
                  Y - xl * s + yl * c) for xl, yl in points_local]
@@ -54,7 +42,7 @@ class Perception:
     # ICP internals
     @staticmethod
     def _solve3(A, b):
-        """solve 3x3 system Ax = b by Gaussian elimination. returns None if singular."""
+        """solve the 3x3 system Ax = b by Gaussian elimination, or None if singular."""
         M = [list(A[i]) + [b[i]] for i in range(3)]
         for col in range(3):
             piv = max(range(col, 3), key=lambda r: abs(M[r][col]))
@@ -75,7 +63,9 @@ class Perception:
     @classmethod
     def localise(cls, points_local, init_pose,
                  inlier_threshold=None, max_iters=None):
-        """refine a pose estimate (init_pose, (X, Y, H_deg)) by matching robot-frame scan points (points_local, list of (xl, yl)) to the nearest field walls, point-to-line ICP."""
+        """refine init_pose (X, Y, H_deg) by point-to-line ICP of robot-frame scan points
+        against the nearest field walls.
+        """
         if inlier_threshold is None:
             inlier_threshold = cls.inlier_threshold_mm
         if max_iters is None:
@@ -83,7 +73,7 @@ class Perception:
 
         X, Y, H = init_pose
 
-        # points_local -> numpy once; every iteration below only rotates it (cheap) rather than rebuilding from the Python list again.
+        # convert once; each iteration below only rotates the array
         if not len(points_local):
             L = np.zeros((0, 2), dtype=np.float64)
         else:
@@ -122,22 +112,22 @@ class Perception:
         py = Y - xl * s + yl * c
         dist, _nx, _ny = FieldModel.nearest_wall_batch(np.column_stack((px, py)))
         inlier_mask = dist <= inlier_threshold
-        inliers  = list(zip(px[inlier_mask].tolist(),  py[inlier_mask].tolist()))
+        inliers = list(zip(px[inlier_mask].tolist(), py[inlier_mask].tolist()))
         outliers = list(zip(px[~inlier_mask].tolist(), py[~inlier_mask].tolist()))
         rms = (math.sqrt(float(np.mean(dist[inlier_mask] ** 2)))
                if inliers else float("inf"))
 
         return {
-            "pose":         (float(X), float(Y), float(H % 360.0)),
-            "inliers":      inliers,
-            "outliers":     outliers,
-            "rms_mm":       float(rms),
+            "pose": (float(X), float(Y), float(H % 360.0)),
+            "inliers": inliers,
+            "outliers": outliers,
+            "rms_mm": float(rms),
             "inlier_count": len(inliers),
         }
 
     @staticmethod
     def _frange(start, stop, step):
-        """like range(), but for floats, inclusive of stop (within a small epsilon)."""
+        """range() for floats, inclusive of stop (within a small epsilon)."""
         vals, x = [], start
         while x <= stop + 1e-6:
             vals.append(x)
@@ -151,7 +141,9 @@ class Perception:
                         inlier_threshold=None, min_inliers=40,
                         rough_region=None,
                         known_heading=None, heading_tolerance=20.0):
-        """determine the robot's pose from scratch (no prior knowledge)."""
+        """the robot's pose from scratch: grid search, refine the best seeds, then test the
+        180-degree twin.
+        """
         if inlier_threshold is None:
             inlier_threshold = cls.inlier_threshold_mm
         if refine_iters is None:
@@ -200,16 +192,14 @@ class Perception:
                         twin["rms_mm"] <= best["rms_mm"] * 1.3)
 
         result = dict(best)
-        result["ambiguous"]      = is_ambiguous
+        result["ambiguous"] = is_ambiguous
         result["alternate_pose"] = twin["pose"] if is_ambiguous else None
-        result["resolved"]       = not is_ambiguous
+        result["resolved"] = not is_ambiguous
 
-        # A real heading prior beats a position guess: best's heading came
-        # from a known_heading-filtered seed, so it's already within
-        # heading_tolerance of a trusted value, while twin's 180deg-off
-        # heading is outside it. rough_region (only "roughly which half",
-        # from where the robot used to be) only gets a say with no heading
-        # prior to trust at all, a true cold start.
+        # A heading prior beats a position guess: best came from a seed already
+        # within heading_tolerance of a trusted heading, and the twin is 180 deg
+        # off it. rough_region (which half the robot was last in) only decides on
+        # a true cold start with no heading prior.
         if is_ambiguous and known_heading is not None:
             result["resolved"] = True
         elif is_ambiguous and rough_region is not None:
@@ -217,13 +207,14 @@ class Perception:
             if (math.hypot(twin["pose"][0] - rx, twin["pose"][1] - ry) <
                     math.hypot(bx - rx, by - ry)):
                 result = dict(twin)
-                result["ambiguous"]      = True
+                result["ambiguous"] = True
                 result["alternate_pose"] = best["pose"]
             result["resolved"] = True
 
         return result
 
-    # Obstacle detection: every candidate point is ray-tested against the known wall model, clusters split on range/size and circle-fit, capped at 1-3 bots.
+    # Obstacle detection: ray-test candidate points against the wall model, cluster,
+    # split on range and size, circle-fit, and keep at most max_robots_on_field.
 
     @classmethod
     def _object_points(cls, outliers, sensor_xy):
@@ -268,7 +259,9 @@ class Perception:
 
     @classmethod
     def _split_oversized(cls, cluster, depth=0):
-        """recursively split a cluster wider than max_cluster_span_mm at its largest internal gap (two adjacent bots)."""
+        """split a cluster wider than max_cluster_span_mm at its largest internal gap (two
+        adjacent bots).
+        """
         if cls.cluster_span(cluster) <= cls.max_cluster_span_mm:
             return [cluster]
         if depth >= 2 or len(cluster) < 4:
@@ -286,21 +279,25 @@ class Perception:
 
     @classmethod
     def _inside_playable(cls, x, y):
-        """True if (x, y) is inside the field, clear of walls and goal boxes, a candidate robot centre must be."""
+        """True if (x, y) could be a robot centre: in the field and clear of the walls and goal
+        structures.
+        """
         m = cls.field_margin_mm
         if not (m <= x <= FieldModel.field_x - m
                 and m <= y <= FieldModel.field_y - m):
             return False
         bx0 = FieldModel.bx0 - m
         bx1 = FieldModel.bx1 + m
-        gd  = FieldModel.goal_depth + m
+        gd = FieldModel.goal_depth + m
         if bx0 <= x <= bx1 and (y <= gd or y >= FieldModel.field_y - gd):
             return False
         return True
 
     @classmethod
     def _circle_residual(cls, cluster, cx, cy, radius=None):
-        """RMS of |point - centre| - radius over the cluster (mm), how well a fixed-radius circle fits."""
+        """RMS of |point - centre| - radius over the cluster (mm): how well a fixed-radius
+        circle fits.
+        """
         if radius is None:
             radius = cls.robot_radius_mm
         sq = 0.0
@@ -317,14 +314,16 @@ class Perception:
 
     @classmethod
     def fit_circle_centre(cls, cluster, sensor_xy, radius=None, iters=8):
-        """fit a robot centre to its visible near-side arc (cluster, a list of (x, y) field-frame points) using Gauss-Newton least squares on the constraint |p_i - C| = radius, seen from sensor_xy (the observing LiDAR's position)."""
+        """fit a robot centre to its visible near-side arc by Gauss-Newton on |p_i - C| =
+        radius, seen from sensor_xy.
+        """
         if radius is None:
             radius = cls.robot_radius_mm
         cx = sum(p[0] for p in cluster) / len(cluster)
         cy = sum(p[1] for p in cluster) / len(cluster)
         sx, sy = sensor_xy
         dx, dy = cx - sx, cy - sy
-        dist   = math.hypot(dx, dy)
+        dist = math.hypot(dx, dy)
         if dist > 1e-6:
             cx += dx / dist * radius * 0.5
             cy += dy / dist * radius * 0.5
@@ -339,7 +338,7 @@ class Perception:
                 ux, uy = ex / d, ey / d
                 r = d - radius
                 Sxx += ux * ux; Sxy += ux * uy; Syy += uy * uy
-                bx  += ux * r;  by  += uy * r
+                bx += ux * r; by += uy * r
             det = Sxx * Syy - Sxy * Sxy
             if abs(det) < 1e-9:
                 break
@@ -351,7 +350,8 @@ class Perception:
         return cx, cy
 
     @classmethod
-    def detect_robots(cls, outliers, sensor_xy, max_span=None, min_points=None):
+    def detect_robots(cls, outliers, sensor_xy, teammate_pos=None,
+                      max_span=None, min_points=None):
         """turn non-wall outlier points into robot detections."""
         if max_span is None:
             max_span = cls.max_cluster_span_mm
@@ -359,13 +359,19 @@ class Perception:
         candidates = []
         for raw in cls._cluster(cls._object_points(outliers, sensor_xy)):
             for cluster in cls._split_oversized(raw):
+                if teammate_pos is not None:
+                    ax = sum(p[0] for p in cluster) / len(cluster)
+                    ay = sum(p[1] for p in cluster) / len(cluster)
+                    if (math.hypot(ax - teammate_pos[0], ay - teammate_pos[1])
+                            <= cls.robot_radius_mm * 2.0):
+                        continue
                 span = cls.cluster_span(cluster)
                 if not (cls.min_span_mm <= span <= max_span):
                     continue
                 rng = sum(p[2] for p in cluster) / len(cluster)
-                # Fraction of the points a bot-sized arc at this range would
-                # return; demand at least about 15% of them (and never fewer than
-                # the caller's floor).
+                # a bot-sized arc at this range should return about n_exp
+                # points; demand 15% of them (and never fewer than the
+                # caller's floor)
                 n_exp = (2.0 * math.asin(min(1.0, cls.robot_radius_mm / rng))
                          / cls.scan_step_rad)
                 floor = max(min_points or 2, int(0.15 * n_exp))
@@ -382,16 +388,16 @@ class Perception:
                         * (1.0 - resid / cls.circle_resid_max_mm))
                 candidates.append({
                     "x": cx, "y": cy,
-                    "points":   len(cluster),
+                    "points": len(cluster),
                     "points_xy": xy, # boundary points, for EnemyProfile
-                    "span_mm":  span,
+                    "span_mm": span,
                     "resid_mm": resid,
-                    "conf":     conf,
+                    "conf": conf,
                 })
 
-        # Merge candidates that are really the same bot: a robot's arc chopped
-        # by a dropout, a handle wedge or partial occlusion yields several
-        # fragments whose circle fits all land on one centre.
+        # Merge fragments of one robot: a dropout, handle wedge or partial
+        # occlusion chops an arc into pieces whose circle fits all land on one
+        # centre.
         candidates.sort(key=lambda d: d["conf"], reverse=True)
         merged = []
         for d in candidates:
@@ -401,10 +407,10 @@ class Perception:
                     w = wm + wd
                     m["x"] = (m["x"] * wm + d["x"] * wd) / w
                     m["y"] = (m["y"] * wm + d["y"] * wd) / w
-                    m["points"]  = w
+                    m["points"] = w
                     m["points_xy"] = m.get("points_xy", []) + d.get("points_xy", [])
                     m["span_mm"] = max(m["span_mm"], d["span_mm"])
-                    m["conf"]    = max(m["conf"], d["conf"])
+                    m["conf"] = max(m["conf"], d["conf"])
                     break
             else:
                 merged.append(d)

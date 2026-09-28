@@ -1,31 +1,20 @@
-// camera_native.cpp - fused C++ kernel for detect_ball_warp's own hot
-// preamble (bot/vision.py): cv2.remap (fisheye unwarp) + cv2.cvtColor
-// (BGR->HSV) + _sat_boost + cv2.inRange, currently four SEPARATE
-// full-(n_r x n_theta)-frame passes each allocating and writing their
-// own output array. Fused into one pass per output pixel - compute
-// the bilinear-sampled BGR, convert to HSV, save the raw S, apply the
-// saturation boost, and threshold, all before moving to the next pixel,
-// instead of walking the whole image four times over four different
-// arrays.
+// camera_native.cpp: fused C++ kernel for the start of detect_ball_warp
+// (bot/vision.py). The Python path makes four full-frame passes (cv2.remap
+// for the fisheye unwarp, cv2.cvtColor to HSV, _sat_boost, cv2.inRange),
+// each writing its own array. This does all four per output pixel in one
+// pass: sample the BGR bilinearly, convert to HSV, keep the raw S, apply
+// the saturation boost and threshold, then move on.
 //
-// NOT a reimplementation of what OpenCV is bad at - cv2's own C++ is
-// already fast per-call. The win here is specifically kernel fusion
-// (memory-bandwidth/cache locality from one pass instead of four), the
-// same category of optimisation a single generic library call can't do
-// automatically across an arbitrary multi-step pipeline. _find_ball_
-// columns/_subpixel_centre (small-window operations downstream) are
-// untouched - already cheap, not worth the risk of reimplementing.
+// The point was cache locality, not beating OpenCV per call (its C++ is
+// already fast). _find_ball_columns and _subpixel_centre work on small
+// windows downstream and are left alone.
 //
-// HSV conversion is a standard textbook BGR->HSV (H 0..179, S/V 0..255,
-// matching cv2.cvtColor's own output range for 8-bit images), NOT
-// verified bit-exact against OpenCV's own fixed-point/table-based
-// implementation - empirically found to differ from cv2.cvtColor by at
-// most +-1 per channel on random test images (rounding only, see
-// native/test_camera_native.py), never more. Documented honestly rather
-// than claimed as exact; a +-1 HSV difference is far inside this
-// pipeline's own existing thresholds' tolerance (lower/upper bounds
-// spanning dozens of units), so it doesn't change which pixels pass
-// cv2.inRange in practice, but it's not literally the same code path.
+// The HSV conversion is the textbook one (H 0..179, S/V 0..255, same
+// ranges as cv2.cvtColor for 8-bit images). It isn't bit-exact with
+// OpenCV's fixed-point version: on random images it differs by at most 1
+// per channel (rounding, see native/test_camera_native.py). The HSV
+// thresholds are dozens of units wide, so that doesn't change which pixels
+// pass in practice.
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <algorithm>
@@ -41,7 +30,7 @@ static inline uint8_t clamp_u8(int v) {
 }
 
 // Bilinear-sample BGR at floating point (fx, fy) from an (H, W, 3) uint8
-// image, matching cv2.remap's own INTER_LINEAR + BORDER_CONSTANT (0)
+// image, matching cv2.remap's INTER_LINEAR + BORDER_CONSTANT (0)
 // behaviour for out-of-bounds samples.
 static inline void sample_bgr(const uint8_t *frame, int H, int W,
                               double fx, double fy, double out[3]) {
@@ -66,8 +55,8 @@ static inline void sample_bgr(const uint8_t *frame, int H, int W,
     }
 }
 
-// Standard BGR->HSV (H 0..179, S/V 0..255) - see this file's own header
-// comment for the +-1-vs-cv2.cvtColor caveat.
+// Standard BGR->HSV (H 0..179, S/V 0..255). See the header for the +-1
+// difference from cv2.cvtColor.
 static inline void bgr_to_hsv(double b, double g, double r,
                               uint8_t &h_out, uint8_t &s_out, uint8_t &v_out) {
     double v = std::max({b, g, r});
@@ -113,7 +102,7 @@ static py::tuple unwarp_threshold(
     auto s_raw = s_raw_out.mutable_unchecked<2>();
     auto mask = mask_out.mutable_unchecked<2>();
 
-    // logistic saturation boost, matching _sat_boost's own constants exactly
+    // logistic saturation boost, matching _sat_boost's constants exactly
     double lo = 1.0 / (1.0 + std::exp(sat_boost_k * sat_boost_mid));
     double hi = 1.0 / (1.0 + std::exp(-sat_boost_k * (1.0 - sat_boost_mid)));
 
@@ -124,9 +113,9 @@ static py::tuple unwarp_threshold(
         for (py::ssize_t j = 0; j < n_theta; ++j) {
             double bgr[3];
             sample_bgr(frame_ptr, H, W, mx(i, j), my(i, j), bgr);
-            // cv2.remap's own output is a uint8 image (rounded), and
-            // cv2.cvtColor then runs on THAT rounded image, not on the
-            // raw bilinear float - round here first to match, otherwise
+            // cv2.remap's output is a uint8 image (rounded), and
+            // cv2.cvtColor then runs on that rounded image, not on the
+            // raw bilinear float. Round here first to match, otherwise
             // low-V pixels (S = diff*255/V) amplify the skipped rounding
             // into large S errors. Confirmed directly: this was the
             // actual cause of the largest mismatches found while testing

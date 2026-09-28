@@ -1,0 +1,16 @@
+[Unit]
+Description=Thermite robot control service
+After=multi-user.target
+
+[Service]
+Type=simple
+User=thermite
+WorkingDirectory=/home/thermite/Stuff
+# Set this per Pi: bot1 uses 1, bot2 uses 2.
+Environment=ROBOT_ID=1
+ExecStart=/bin/bash /home/thermite/Stuff/start.sh
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

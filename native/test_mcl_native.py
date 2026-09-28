@@ -1,5 +1,6 @@
-"""Parity + benchmark for mcl_native against bot/localisation.py's own
-pure-numpy math. Run from the repo root: `python3 native/test_mcl_native.py`."""
+"""Parity + benchmark for mcl_native against bot/localisation.py's pure-numpy math. Run
+from the repo root: `python3 native/test_mcl_native.py`.
+"""
 import sys
 import time
 
@@ -41,7 +42,7 @@ def py_resample(particles, weights, u0):
 
 def test_sensor_weights_parity():
     rng = np.random.default_rng(3)
-    seg_a, seg_ex, seg_ey = FieldModel.seg_a, FieldModel.seg_ex, FieldModel.seg_ey
+    seg_a, seg_ex, seg_ey = FieldModel._seg_a, FieldModel._seg_ex, FieldModel._seg_ey
     for trial in range(10):
         n_particles = rng.integers(20, 400)
         n_pts = rng.integers(5, 100)
@@ -86,7 +87,7 @@ def bench():
         rng.uniform(0, 360, n_particles),
     ])
     points = np.column_stack([rng.normal(0, 800, 60), rng.normal(0, 800, 60)])
-    seg_a, seg_ex, seg_ey = FieldModel.seg_a, FieldModel.seg_ex, FieldModel.seg_ey
+    seg_a, seg_ex, seg_ey = FieldModel._seg_a, FieldModel._seg_ex, FieldModel._seg_ey
     sigma = 70.0
 
     N = 200
@@ -99,7 +100,7 @@ def bench():
     t2 = time.perf_counter()
     py_t, cpp_t = t1 - t0, t2 - t1
     print(f"python sensor_weights: {py_t/N*1000:.3f} ms/call")
-    print(f"cpp    sensor_weights: {cpp_t/N*1000:.3f} ms/call   speedup: {py_t/cpp_t:.1f}x")
+    print(f"cpp sensor_weights: {cpp_t/N*1000:.3f} ms/call speedup: {py_t/cpp_t:.1f}x")
 
 
 if __name__ == "__main__":

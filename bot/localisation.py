@@ -1,39 +1,8 @@
-"""
-bot/localisation.py: a real 2D Monte Carlo Localisation (particle filter) -
-the robot's only pose estimator. Ported idea from a second reference project:
-its own localisation is a native (C++) particle filter with IMU yaw fed in as
-a soft heading prior, a structurally different (and generally more robust to
-partial occlusion and the field's left-right symmetry) approach than the
-point-to-line ICP scan-matching this codebase used to run instead.
+"""Monte Carlo Localisation (particle filter): the robot's only pose estimator.
 
-Not a reskin of ICP: this keeps its own persistent particle population across
-calls (an actual filter, not a single best-fit refined per call), uses a real
-odometry-driven motion model (drive() the particles, THEN weight them against
-the scan) and a likelihood-field sensor model (reusing
-FieldModel.nearest_wall_batch, the same wall-distance primitive ICP's own
-point-to-line residual was built on - the field geometry is shared, only how
-the pose is estimated from it differs), low-variance resampling, and a genuine
-soft IMU-yaw prior baked into the particle weights every tick (not a
-heading-delta bolt-on carried between lidar revolutions the way the old ICP
-path's IMU assist worked).
-
-localise(points_local, init_pose, ...) and global_localise(points_local, ...)
-are what bot/perception.py's Perception hands its own two localisation entry
-points off to, so lidar_thread (bot/lidar.py) drives the same scan
-acquisition/motion-deskew/quality-watchdog loop it always did; only the
-pose-estimation algorithm underneath is this. One MCL instance persists between
-calls (bot/perception.py owns it) since a particle filter's whole value is
-carrying its belief forward, not refitting from scratch every tick.
-
-Uses its own independent WheelOdometry instance for the motion model's
-translation component, NOT state.wheel_odom - that instance is already polled
-once per revolution by lidar_thread's own deskew step (sec 4.13's own comment
-explains why two pollers sharing one WheelOdometry would each reset the other's
-last-poll baseline), so this needs its own, exactly the same reasoning that
-already gives odom_thread its own separate state.odom_wheel instance. The
-rotation component reuses imu_turn_between directly (a read against a
-timestamped history buffer, not a stateful poll - safe to call
-independently).
+Wheel odometry and the IMU turn drive the motion update; the likelihood field against
+FieldModel weights the particles. It copes better with partial occlusion and the field's
+left-right symmetry than the point-to-line ICP it replaced.
 """
 
 
@@ -44,20 +13,16 @@ import time
 
 import numpy as np
 
-from bot.compass import _imu_turn_between as imu_turn_between
+from bot.compass import heading_carry_max_deg
+from bot.diagnostics import health_stale_s, _health_t
 from bot.field import FieldModel, wrap_deg
 from bot.odometry import WheelOdometry
 from bot.state import _lock as lock, _state as shared_state
 
-# native/mcl_native.{so,pyd}: C++ port of the three per-tick hot loops
-# (motion update, likelihood-field sensor weighting, resampling) - see
-# native/mcl_native.cpp's own header comment. Measured ~18x faster on
-# sensor_weights alone (the dominant cost: O(n_particles * n_scan_points *
-# n_wall_segments)), confirmed a real chunk of the localisation budget
-# (~30ms/call in pure Python at 300 particles/60 points). Falls back to
-# the pure-numpy implementations below (byte-for-byte / machine-precision
-# parity tested, see native/test_mcl_native.py) if the extension isn't
-# built for this platform.
+# Optional compiled core for the three hot loops (motion update, sensor weighting,
+# resampling), about 70x faster on sensor_weights. Falls back to the numpy code below if
+# not built; parity is tested in tests/test_runtime_integrity.py and
+# native/test_mcl_native.py.
 try:
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "native"))
     import mcl_native
@@ -66,9 +31,9 @@ except ImportError:
 
 
 def circular_mean_deg(angles_deg, weights=None):
-    """weighted circular mean, see RollingYawSampler below (that project's
-    own startup-yaw averaging) for why (atan2 of the weighted sin/cos sums,
-    not a naive mean that breaks across +-180)."""
+    """weighted circular mean (atan2 of the weighted sin/cos sums, so it survives the +-180
+    wrap).
+    """
     angles_deg = np.asarray(angles_deg, dtype=np.float64)
     if weights is None:
         weights = np.ones_like(angles_deg)
@@ -81,10 +46,9 @@ def circular_mean_deg(angles_deg, weights=None):
 
 
 class RollingYawSampler:
-    """Ported from that second reference project's own RollingYawSampler: circularly
-    average the latest complete window of yaw samples, for a startup
-    heading reference that isn't just the first (possibly noisy) IMU
-    reading. See circular_mean_deg's own comment for why circular."""
+    """circular mean of the latest full window of yaw samples: a startup baseline that isn't
+    just the first reading.
+    """
 
     def __init__(self, sample_count=12):
         self.samples = []
@@ -105,13 +69,10 @@ class RollingYawSampler:
 
 
 def capture_startup_yaw(sample_count=12, sample_interval=0.05, timeout_s=3.0):
-    """Average a short burst of IMU headings so the startup heading isn't
-    just the first reading - see RollingYawSampler's own comment. Reads the
-    IMU heading history bot/compass.py publishes into the shared shared_state, the
-    same sensor the pose fusion already runs off.
-    Returns None if no IMU reading ever arrives within timeout_s (no IMU
-    fitted, or it hasn't warmed up yet) - callers should treat that as
-    "no soft prior available", not fail outright."""
+    """circular mean of a short burst of IMU headings from _state["imu_heading"], or None if no
+    reading arrives within timeout_s (no IMU, or not warmed up): treat that as "no prior",
+    not a failure.
+    """
     sampler = RollingYawSampler(sample_count)
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -125,46 +86,111 @@ def capture_startup_yaw(sample_count=12, sample_interval=0.05, timeout_s=3.0):
 
 
 class MCL:
-    """Particle-filter localisation, behind Perception.localise/
-    global_localise (bot/perception.py). See module docstring."""
+    """particle-filter localisation with Perception's localise/global_localise interface."""
 
-    n_particles           = 300
-    sensor_sigma_mm        = 70.0     # likelihood-field Gaussian width
-    sensor_sample_stride   = 3         # subsample scan points for the per-particle sensor update (perf)
-    trans_noise_frac       = 0.04      # motion noise proportional to distance moved
-    trans_noise_floor_mm   = 1.5
-    turn_noise_frac        = 0.03      # motion noise proportional to heading change
-    turn_noise_floor_deg   = 0.25
-    resample_ess_frac      = 0.5       # resample once effective sample size drops below this fraction of n_particles
-    imu_prior_sigma_deg    = 10.0      # soft heading-prior width (wide: a hint, not a hard constraint)
-    inlier_threshold_mm    = 60.0      # for the returned inliers/outliers/rms_mm, matching Perception's own field names
+    n_particles = 300
+    sensor_sigma_mm = 70.0 # likelihood-field Gaussian width
+    sensor_sample_stride = 3 # subsample scan points for the sensor update (perf)
+    trans_noise_frac = 0.04 # motion noise proportional to distance moved
+    trans_noise_floor_mm = 1.5
+    turn_noise_frac = 0.03 # motion noise proportional to heading change
+    turn_noise_floor_deg = 0.25
+    resample_ess_frac = 0.5 # resample once ESS drops below this fraction of n_particles
+    imu_prior_sigma_deg = 10.0 # soft heading-prior width (wide: a hint, not a constraint)
+    # The prior is dropped once the last good IMU sample is older than health_stale_s.
+    # That covers the imu_fault latch and also a compass thread that hung without
+    # erroring, where imu_heading just freezes.
+    imu_prior_max_age_s = health_stale_s
+    # Off by default: this is the one absolute use of the IMU (every other consumer
+    # takes deltas, so frames cancel). The BNO08x zeroes its yaw at boot, so the prior
+    # assumes the robot's field heading at boot equals the captured baseline. Settle
+    # that at the bench first (BENCH_TEST_CHECKLIST section 9).
+    imu_prior_enabled = False
+    # Motion-update turn from the IMU: the change between the live readings at consecutive
+    # updates. Two live samples, so there is no history window to fall off the end of (the
+    # old window ended at "now", which the history never covers, so the turn was always 0).
+    # False reverts to sensor-only rotation tracking.
+    imu_motion_enabled = True
+    inlier_threshold_mm = 60.0 # for the returned inliers/outliers/rms_mm
 
     def __init__(self, n_particles=None):
         if n_particles is not None:
             self.n_particles = n_particles
-        self.particles    = None   # (N, 3): x, y, theta_deg
-        self.weights      = None   # (N,)
-        self.odom         = WheelOdometry()   # own instance, see module docstring
-        self.imu_bias_deg = None         # set via set_imu_yaw_prior, optional soft prior centre offset
-        self.rng          = np.random.default_rng()
+        self.particles = None # (N, 3): x, y, theta_deg
+        self.weights = None # (N,)
+        # own instance: sharing one would reset another poller's baseline
+        self.odom = WheelOdometry()
+        self.imu_bias_deg = None # soft prior centre, set by set_imu_yaw_prior
+        self.imu_ref_raw_deg = None # imu_heading at the moment that baseline was captured
+        self.imu_bias_t = None # capture time, telemetry only
+        self.imu_prior_seen = None # (raw, monotonic t) last used by prior_heading_deg
+        self.imu_motion_last = None # imu_heading at the last motion update
+        self.rng = np.random.default_rng()
 
-    # Optional IMU soft prior (that project's "feed_imu_yaw_prior" idea)
-    def set_imu_yaw_prior(self, startup_yaw_deg):
-        """Call once at startup with capture_startup_yaw()'s result (or
-        None to disable). The prior tracks IMU heading deltas from this
-        reference each tick (see prior_heading_deg), not a fixed value."""
+    # Optional IMU soft prior: re-derived every sensor update from the live reading,
+    # and cleared whenever the sensor is stale or missing.
+    def set_imu_yaw_prior(self, startup_yaw_deg, startup_raw_yaw_deg=None):
+        """set the prior's baseline once at startup (None disables it). The centre then tracks
+        the IMU's turn since capture (see prior_heading_deg). startup_raw_yaw_deg is the
+        raw reading at capture if the baseline is in another frame; it defaults to
+        startup_yaw_deg.
+        """
         self.imu_bias_deg = startup_yaw_deg
+        self.imu_ref_raw_deg = (startup_yaw_deg if startup_raw_yaw_deg is None
+                                else startup_raw_yaw_deg)
         self.imu_bias_t = time.monotonic()
+        self.imu_prior_seen = None
+
+    def clear_imu_yaw_prior(self):
+        """drop the soft heading prior until set_imu_yaw_prior() is called again."""
+        self.imu_bias_deg = None
+        self.imu_prior_seen = None
 
     def prior_heading_deg(self):
-        if self.imu_bias_deg is None:
+        """soft prior centre (field-frame heading, deg) for this sensor update, or None to run
+        without one.
+        """
+        if not self.imu_prior_enabled or self.imu_bias_deg is None:
             return None
-        d = imu_turn_between(self.imu_bias_t, time.monotonic())
-        if d is None:
+        now = time.monotonic()
+        last_good = _health_t.get("imu")
+        if last_good is None or now - last_good > self.imu_prior_max_age_s:
+            return None # no fresh good sample to derive a hint from
+        with lock:
+            raw_now = shared_state["imu_heading"]
+        if raw_now is None:
             return None
-        return wrap_deg(self.imu_bias_deg + d)
+        prev = self.imu_prior_seen
+        if prev is not None and now - prev[1] > self.imu_prior_max_age_s:
+            # Our last sample is stale too and the reading jumped across the
+            # gap: the chip re-zeroed its yaw (brownout or restart), so the
+            # baseline's frame is gone. Same rule as the heading carry: a
+            # jump past heading_carry_max_deg is a stale baseline, not a
+            # turn. Drop it.
+            if abs(wrap_deg(raw_now - prev[0])) > heading_carry_max_deg:
+                self.clear_imu_yaw_prior()
+                return None
+        self.imu_prior_seen = (raw_now, now)
+        return wrap_deg(self.imu_bias_deg + wrap_deg(raw_now - self.imu_ref_raw_deg))
 
-    # Particle population management
+    def imu_turn_since_last(self):
+        """IMU turn (deg, cw+) since the previous call, or None: no reading, a stale sensor,
+        or a jump too big to be a turn (a re-zeroed chip). Every call moves the baseline.
+        """
+        with lock:
+            raw = shared_state["imu_heading"]
+        prev, self.imu_motion_last = self.imu_motion_last, raw
+        if not self.imu_motion_enabled or raw is None or prev is None:
+            return None
+        last_good = _health_t.get("imu")
+        if last_good is None or time.monotonic() - last_good > health_stale_s:
+            return None
+        d = wrap_deg(raw - prev)
+        if abs(d) > heading_carry_max_deg:
+            return None
+        return d
+
+    # Particle population
     def seed_gaussian(self, pose, spread_mm=180.0, spread_deg=20.0):
         x, y, h = pose
         n = self.n_particles
@@ -196,7 +222,7 @@ class MCL:
     # Motion model
     def motion_update(self, now):
         fwd_right = self.odom.poll(now)
-        dth = imu_turn_between(now - 0.12, now)
+        dth = self.imu_turn_since_last()
         if dth is None:
             dth = 0.0
         if fwd_right is None:
@@ -210,9 +236,8 @@ class MCL:
         turn_noise = self.turn_noise_frac * abs(dth) + self.turn_noise_floor_deg
 
         if mcl_native is not None:
-            # seeded from self.rng so a fixed numpy seed still gives
-            # reproducible runs end to end, even though the noise draws
-            # themselves happen in a separate (C++) RNG stream.
+            # seeded from self.rng so a fixed numpy seed still reproduces a
+            # run end to end
             seed = int(self.rng.integers(0, 2**63 - 1))
             self.particles = np.ascontiguousarray(self.particles, dtype=np.float64)
             mcl_native.motion_update(self.particles, fwd, right, dth,
@@ -225,18 +250,16 @@ class MCL:
         right_n = self.rng.normal(right, trans_noise, n)
         dth_n = self.rng.normal(dth, turn_noise, n)
 
-        # rotate each particle's own robot-frame (fwd, right) into ITS OWN
-        # field-frame heading - the whole point of per-particle motion:
-        # particles with different headings disperse differently for the
-        # same measured body-frame displacement, exactly what lets the
-        # sensor update later disambiguate them.
+        # rotate each particle's robot-frame (fwd, right) by its heading, so
+        # particles with different headings spread differently and the sensor
+        # update can tell them apart
         ch, sh = np.cos(th), np.sin(th)
         dx = ch * right_n + sh * fwd_n
         dy = ch * fwd_n - sh * right_n
         self.particles[:, 0] += dx
         self.particles[:, 1] += dy
         self.particles[:, 2] = (self.particles[:, 2] + dth_n) % 360.0
-        # keep particles on the field - a real robot can't be off it
+        # keep particles on the field
         np.clip(self.particles[:, 0], -50.0, FieldModel.field_x + 50.0, out=self.particles[:, 0])
         np.clip(self.particles[:, 1], -50.0, FieldModel.field_y + 50.0, out=self.particles[:, 1])
 
@@ -250,20 +273,20 @@ class MCL:
             pts = pts[::self.sensor_sample_stride]
 
         if mcl_native is not None:
-            seg_a = np.ascontiguousarray(FieldModel.seg_a, dtype=np.float64)
-            seg_ex = np.ascontiguousarray(FieldModel.seg_ex, dtype=np.float64)
-            seg_ey = np.ascontiguousarray(FieldModel.seg_ey, dtype=np.float64)
+            seg_a = np.ascontiguousarray(FieldModel._seg_a, dtype=np.float64)
+            seg_ex = np.ascontiguousarray(FieldModel._seg_ex, dtype=np.float64)
+            seg_ey = np.ascontiguousarray(FieldModel._seg_ey, dtype=np.float64)
             w = mcl_native.sensor_weights(
                 np.ascontiguousarray(self.particles, dtype=np.float64),
                 np.ascontiguousarray(pts, dtype=np.float64),
                 seg_a, seg_ex, seg_ey, self.sensor_sigma_mm)
         else:
             xl, yl = pts[:, 0], pts[:, 1]
-            x = self.particles[:, 0][:, None]      # (N, 1)
+            x = self.particles[:, 0][:, None] # (N, 1)
             y = self.particles[:, 1][:, None]
             h = np.radians(self.particles[:, 2])[:, None]
             c, s = np.cos(h), np.sin(h)
-            px = x + xl[None, :] * c + yl[None, :] * s     # (N, M)
+            px = x + xl[None, :] * c + yl[None, :] * s # (N, M)
             py = y - xl[None, :] * s + yl[None, :] * c
 
             flat = np.column_stack([px.ravel(), py.ravel()])
@@ -272,7 +295,7 @@ class MCL:
 
             mean_sq = np.mean(np.minimum(dist, 4.0 * self.sensor_sigma_mm) ** 2, axis=1)
             log_w = -mean_sq / (2.0 * self.sensor_sigma_mm ** 2)
-            log_w -= log_w.max()   # numerically stable before exponentiating
+            log_w -= log_w.max() # numerically stable before exponentiating
             w = np.exp(log_w)
             total = w.sum()
             w = np.full(n_particles, 1.0 / n_particles) if total <= 1e-300 else w / total
@@ -303,7 +326,7 @@ class MCL:
         else:
             positions = (u0 + np.arange(n)) / n
             cumsum = np.cumsum(self.weights)
-            cumsum[-1] = 1.0   # guard float rounding
+            cumsum[-1] = 1.0 # guard float rounding
             idx = np.searchsorted(cumsum, positions)
             self.particles = self.particles[idx].copy()
         self.weights = np.full(n, 1.0 / n)
@@ -336,31 +359,27 @@ class MCL:
 
     # Perception-compatible entry points
     def localise(self, points_local, init_pose, inlier_threshold=None, max_iters=None):
-        """Perception.localise's signature/return shape (max_iters is
-        accepted and ignored - a particle filter has no per-call
-        iteration count, its "iteration" is every tick's filter cycle)."""
+        """Perception.localise's signature and return shape; one filter cycle per call
+        (max_iters is ignored, and init_pose only seeds the first call).
+        """
         now = time.monotonic()
         if self.particles is None:
             self.seed_gaussian(init_pose)
-            self.odom.poll(now)   # prime the odometry baseline, first delta is meaningless
+            self.odom.poll(now) # prime the odometry baseline, first delta is meaningless
+            self.imu_turn_since_last() # and the IMU turn baseline
         else:
             self.motion_update(now)
+
         self.weights = self.sensor_weights(points_local)
         pose = self.estimate_pose()
         self.resample()
         return self.result_for(pose, points_local)
 
-    # Exploration jitter schedule for global_localise, decreasing per round
-    # (simulated-annealing style): a single static scan gives resampling
-    # nothing to diversify against (no real motion between rounds the way
-    # normal tracking gets), so pure resample-only rounds collapse onto
-    # whatever mode looks best in round 1 and get stuck there - confirmed
-    # directly (a synthetic global search converged to a false mode ~700mm
-    # off and stayed there every subsequent round, ESS never dropping low
-    # enough to trigger another resample). Injecting shrinking jitter noise
-    # into every particle each round (not just the resampled survivors)
-    # keeps the population exploring long enough for the true mode to win
-    # out before it's allowed to lock in.
+    # Exploration jitter for global_localise, shrinking each round. One static scan
+    # gives resampling nothing to diversify against, so resample-only rounds lock onto
+    # whatever looks best in round one (seen converging ~700 mm off and staying
+    # there). Jittering every particle each round keeps the population exploring until
+    # the true mode wins.
     global_jitter_schedule = (
         (300.0, 60.0), (200.0, 40.0), (120.0, 25.0),
         (70.0, 12.0), (35.0, 6.0), (15.0, 3.0), (0.0, 0.0),
@@ -370,16 +389,15 @@ class MCL:
                         coarse_iters=None, top_k=None, refine_iters=None,
                         inlier_threshold=None, min_inliers=40,
                         rough_region=None, known_heading=None, heading_tolerance=20.0):
-        """Perception.global_localise's signature/return shape. Scatter
-        particles across the whole field (or rough_region/known_heading,
-        the same hints Perception's version takes) and run several
-        sensor+jitter+resample rounds (see global_jitter_schedule's own
-        comment) to converge before reporting - a particle filter's own
-        natural way of handling "no idea where we are"."""
+        """Perception.global_localise's signature and return shape: scatter particles over the
+        field (or the rough_region/known_heading hints) and run sensor + jitter + resample
+        rounds to converge.
+        """
         if len(points_local) < min_inliers:
             return None
         self.seed_uniform(rough_region, known_heading, heading_tolerance)
         self.odom.poll(time.monotonic())
+        self.imu_turn_since_last() # fresh baseline for the first motion update
         n = len(self.particles)
         for jitter_mm, jitter_deg in self.global_jitter_schedule:
             if jitter_mm or jitter_deg:
