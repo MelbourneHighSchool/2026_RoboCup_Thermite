@@ -4,7 +4,7 @@
 #     python3 -m bot.main --capturelog # log 60 s, then stop
 #     python3 -m bot.main --capturelog 120 # log 120 s
 #
-# One plain-text file per run at logs/capture_YYYYmmdd_HHMMSS.txt. One tick record per
+# One plain-text file per run, capture.txt in the debug session folder. One tick record per
 # pass through StrikerController's ball-visible seek branch: bot pose, ball position, both
 # velocities, and the final drive command, enough to plot the whole capture afterwards and
 # see whether the ball-velocity lead is doing anything and how fast the ball really moved
@@ -189,9 +189,3 @@ def _pct(v, p):
     s = sorted(v)
     k = min(len(s) - 1, max(0, int(round(p / 100.0 * (len(s) - 1)))))
     return s[k]
-
-
-def new_session_path(directory="logs"):
-    """logs/capture_YYYYmmdd_HHMMSS.txt, one file per run, never overwritten."""
-    return os.path.join(directory,
-                        time.strftime("capture_%Y%m%d_%H%M%S.txt"))

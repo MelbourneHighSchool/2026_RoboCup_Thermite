@@ -239,8 +239,3 @@ class MotionLogger:
 
 def _mean(v):
     return sum(v) / len(v) if v else 0.0
-
-
-def new_session_path(directory="logs"):
-    """logs/motion_YYYYmmdd_HHMMSS.txt, one file per run, never overwritten."""
-    return os.path.join(directory, time.strftime("motion_%Y%m%d_%H%M%S.txt"))

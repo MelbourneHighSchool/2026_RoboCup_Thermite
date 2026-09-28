@@ -12,6 +12,7 @@ import subprocess
 import threading
 import time
 
+import bot.debug_session as debug_session
 import bot.state as state
 from bot.field import FieldModel
 from bot.state import _apply_slot_state
@@ -219,6 +220,8 @@ class TeamLink:
         except (ValueError, KeyError, TypeError):
             return # garbage line, skip
         now = time.monotonic()
+        # sender's clock vs ours, so the viewer can line the two sessions up
+        debug_session.link_rx(msg.get("t"), mtype)
         with self._lock:
             prev = self._latest.get(mtype)
             if prev is not None and seq <= prev[2]:

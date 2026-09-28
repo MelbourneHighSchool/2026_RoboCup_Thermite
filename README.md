@@ -18,6 +18,7 @@ rule 4.3.2, say:
 - [Running](#running)
 - [Playing a match](#playing-a-match)
 - [The debug page](#the-debug-page)
+- [Debug sessions: watching a match back](#debug-sessions-watching-a-match-back)
 - [How it works](#how-it-works)
 - [Files](#files)
 - [Configuration](#configuration)
@@ -107,10 +108,10 @@ Command-line options for `bot.main`:
 |---|---|
 | `--hsv` | Colour tuner only: camera and debug page, no motors or lidar |
 | `--kickoff kicking` / `--kickoff receiving` | Hold the kick-off placement at the start of play (4 s, or until the ball moves toward us) |
-| `--record` | Record the match to `logs/match_*.jsonl` for replay (also `RECORD_MATCH=1`, or the debug page) |
-| `--lidarlog [seconds]` | Log localisation to `logs/lidar_*.txt` (default 60 s). Park the robot: any pose movement in the log is error |
-| `--capturelog [seconds]` | Log ball capture (robot and ball positions and velocities) to `logs/capture_*.txt` |
-| `--motionlog [seconds]` | Log motor commands and pose, IMU and wheel telemetry to `logs/motion_*.txt` |
+| `--debug` | Record this power-on as a debug session for replay (also `DEBUG_SESSION=1`, or the debug page) |
+| `--lidarlog [seconds]` | Log localisation to `lidar.txt` in the debug session folder (default 60 s). Park the robot: any pose movement in the log is error |
+| `--capturelog [seconds]` | Log ball capture (robot and ball positions and velocities) to `capture.txt` in the debug session folder |
+| `--motionlog [seconds]` | Log motor commands and pose, IMU and wheel telemetry to `motion.txt` in the debug session folder |
 | `--no-boot-swivel` | Skip the small left-right wiggle the robot does at boot to show the motors are alive |
 
 Other entry points:
@@ -118,6 +119,7 @@ Other entry points:
 ```
 ROBOT_ID=1 python3 -m bot.motorcheck # drive straight at full speed until you press q
 python3 tests/motorcalib.py # calibrate motor encoders (interactive)
+python simulator.py logs/debug_r1_<time> # watch a debug session back (on a laptop)
 ```
 
 ## Playing a match
@@ -151,6 +153,60 @@ The robot serves a web page on port 8080; the console prints the address at star
 
 The HSV tuner and the gate page have a Save button: it prints the values to the terminal for
 you to paste into `bot/vision.py` or `bot/motion.py`.
+
+## Debug sessions: watching a match back
+
+Start the robots with `--debug` (or `DEBUG_SESSION=1`, or the switch on the debug page). A
+debug session lasts as long as the robot is powered on: switching recording off on the debug
+page pauses it, and switching it on again carries on in the same session. For the next match,
+power the robot off and on, and it starts a new one. To record every match, add
+`Environment=DEBUG_SESSION=1` to the systemd service.
+
+Each session is one folder, `logs/debug_r<id>_<time>/`:
+
+| File | What's in it |
+|---|---|
+| `session.json` | The robot, the start time, its clock, and how much has been written (updated every few seconds) |
+| `ticks.jsonl` | One line per play tick (10 a second while idle): pose, ball, enemies, teammate, state, motor commands. Also one line per message from the teammate, which is how two sessions get lined up |
+| `lidar.txt`, `capture.txt`, `motion.txt` | The `--lidarlog`, `--capturelog` and `--motionlog` logs, if you asked for them |
+
+Every file is synced to the card once a second, so pulling the power loses at most the last
+second. Recording pauses itself if the card gets below 500 MB free.
+
+Copy the folders off the Pis and, from this folder on any computer with OpenCV and a screen:
+
+```
+python simulator.py logs/debug_r1_20260928_140312
+python simulator.py logs/debug_r1_20260928_140312 logs/debug_r2_20260928_140305 # both robots
+```
+
+With two sessions, the robots are lined up using the Bluetooth messages they exchanged: each
+message carries the sender's clock, and each robot logs when it arrived on its own clock, so
+comparing the two directions gives the difference between the clocks to within a few hundredths
+of a second. If neither session logged any messages (the link was down), they are lined up on
+the moment each one started playing instead. The viewer opens at the start of play. Our goal is
+always drawn on the left (green), theirs on the right (red), and the field turns round if we
+change ends partway through.
+
+On the field you see each robot's pose and heading, its last few seconds of movement, the line
+to the ball from its camera, its ball estimate (coloured by source: camera, teammate, Kalman
+prediction, memory or pass), and the enemies and teammate it could see. An occluded enemy is
+drawn thin. The panel shows, for the tick on screen, the state the robot went in with and came
+out with, its pose, IMU, camera ball, ball estimate, possession, mouth camera, loop rates, the
+five motor commands, and its last few state changes. The seek bar marks every state change.
+
+| Key | Does |
+|---|---|
+| space | Pause and play |
+| a / d, or left / right | Step one tick back or forward |
+| j / l | Jump 5 s back or forward |
+| [ / ] | Halve or double the playback speed |
+| r | Back to the start of play |
+| t | Trails on and off |
+| q, Esc | Quit |
+
+Click or drag on the bar at the bottom to seek. The window can be resized. Running it with no
+folder prints this help.
 
 ## How it works
 
@@ -211,10 +267,11 @@ the goalie positions at up to about 0.41.
 
 - `bot/`: the robot code (run with `python3 -m bot.main`)
 - `native/`: optional C++ speed-ups and their parity tests
-- `tests/`: pytest suite (no hardware needed) and the motor calibration script
+- `tests/`: pytest suite (no hardware needed), and the motor and ball-shape calibration scripts
 - `tools/`: bench tools you run by hand on the robot
 - `systemd/`: the boot service
 - `start.sh`: boot entry point
+- `simulator.py`: the debug session viewer (see [Debug sessions](#debug-sessions-watching-a-match-back))
 - `BENCH_TEST_CHECKLIST.md`: checks to do on the real robot
 
 ### bot/
@@ -247,7 +304,7 @@ the goalie positions at up to about 0.41.
 | `rotom.py` | The motor driver library (I2C protocol) |
 | `hardware.py` | Where `Motor` is imported from; kicker stub (no kicker is fitted) |
 | `motorcheck.py` | Manual drive test |
-| `match_recorder.py` | `--record` match recording |
+| `debug_session.py` | `--debug` sessions: the tick log and teammate clock rows |
 | `lidar_debug.py`, `capture_debug.py`, `motion_debug.py`, `logs.py` | The `--lidarlog`, `--capturelog` and `--motionlog` loggers |
 
 ### native/
@@ -274,7 +331,9 @@ ones you are most likely to touch:
 |---|---|---|
 | Speeds (`base_speed`, `rush_speed`) | `bot/drive_config.py` | 0.3, 0.5 |
 | Motor encoder calibration (`MOTOR_CALIB`) | `bot/drive_config.py` | |
+| Heading rate source (`imu_gyro_rate_enabled`) | `bot/motion.py` | off (differenced heading); see `BENCH_TEST_CHECKLIST.md` before enabling |
 | Ball and goal colours | `bot/vision.py` | tune with `--hsv` |
+| Ball shape gate (`ball_min_fill_ratio`) | `bot/vision.py` | tune with `tests/fillratio_calib.py` |
 | Camera crop and masks | `bot/bot1_config.py`, `bot/bot2_config.py` | |
 | Default role (`DEFAULT_ROLE`) | per-bot config | bot 1 goalie, bot 2 striker |
 | Robot link on/off (`bt_team_enabled`) | `bot/network.py` | on |
@@ -303,6 +362,14 @@ for any motor it lists.
 Run `ROBOT_ID=1 python3 -m bot.main --hsv`, open the debug page, move the sliders until only
 the ball (or goal) is highlighted, click Save, and paste the printed values into
 `bot/vision.py`.
+
+### Ball shape gate
+
+`ball_min_fill_ratio` in `bot/vision.py` rejects an orange or red blob that isn't round enough
+to be the ball, like a marking on another robot or a red line on the wall. The default is a
+guess. Run `ROBOT_ID=1 python3 tests/fillratio_calib.py` on the robot, press `b` with the ball in
+view at a few ranges and `x` with a decoy in view, then `t` for a suggested value, and paste it
+over the default.
 
 ### Mouth camera
 
@@ -337,6 +404,7 @@ it.
 | A motor doesn't move, or runs rough | Check its address in the per-bot config, then recalibrate it with `tests/motorcalib.py` |
 | Robot drives the wrong way or spins | Check the motor addresses match the wheel positions in the per-bot config |
 | Ball not seen, or seen everywhere | Retune colours with `--hsv`; lighting changes between venues |
+| Ball locks onto a red marker on another robot, or a red wall line | Retune `ball_min_fill_ratio` (`bot/vision.py`, 0.45) with `tests/fillratio_calib.py`. It rejects blobs that aren't round enough to be the ball |
 | Pose jumps around | Run `--lidarlog 60` with the robot parked and read the summary at the end of the log |
 | Robots don't swap roles | Check they are paired, and look for `[team] teammate connected` in the console |
 | Roller doesn't hold the ball | Check `dwibble_calib` in `bot/dwibbler.py` and the roller's address |

@@ -63,6 +63,14 @@ orange_lower = np.array([0, 201, 127], dtype=np.uint8)
 orange_upper = np.array([11, 255, 255], dtype=np.uint8)
 min_orange_px = 3
 
+# A blob has to fill this much of its minimum enclosing circle to count as the ball, so a
+# red marking or stripe can't beat a smaller ball on pixel count. Measured with each axis
+# scaled to the ball's expected size at that row (see _ball_candidates). On synthetic blobs
+# a whole ball measures 0.85 near to 0.5 at 2.5 m, half a ball clipped at an edge about 0.45
+# and a 3:1 stripe 0.35 to 0.4, so far balls sit close to the line. Tune it with
+# tests/fillratio_calib.py.
+ball_min_fill_ratio = 0.45
+
 # Angular ROI tracking: the unwrap axis is angle, so a sector is a column window.
 ball_sector_track = True
 ball_sector_half_deg = 40.0 # search +/- this around the last-seen ball angle
@@ -246,22 +254,119 @@ def build_warp_maps(cx, cy, inner_r, outer_r, n_r, n_theta):
     return map_x, map_y, r_lut, theta_lut
 
 
-def _biggest_blob(mask):
-    """largest connected component of a binary mask as (col, row, w, h, area), or None if none
-    clears min_orange_px.
+def _ring_geometry():
+    """the unwrap for this bot's crop, exclusion and notch settings: (map_x, map_y, r_lut,
+    theta_lut, col_bearing, inner_blank, notch_region, inner_r, outer_r, ring_r). The camera
+    thread uses it, and so should any bench tool that measures what detect_ball_warp sees.
     """
-    n, _lab, stats, cents = cv2.connectedComponentsWithStats(mask, 8)
-    if n <= 1:
-        return None
-    k = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-    if stats[k, cv2.CC_STAT_AREA] < min_orange_px:
-        return None
-    cx, cy = cents[k]
-    return (cx, cy, int(stats[k, cv2.CC_STAT_WIDTH]),
-            int(stats[k, cv2.CC_STAT_HEIGHT]), int(stats[k, cv2.CC_STAT_AREA]))
+    crop_w = sensor_size[0] - crop_left - crop_right
+    crop_h = sensor_size[1] - crop_top - crop_bottom
+    ccx = crop_w // 2
+    ccy = crop_h // 2
+    max_r = min(crop_w, crop_h) // 2
+    inner_r = int(exclusion_inner_frac * max_r)
+    outer_r = int(exclusion_outer_frac * max_r)
+    # the unwrap starts at the notch depth so the mouth wedge gets sampled; outside
+    # the wedge those extra near rows are blanked again below (inner_blank)
+    notch_px = int(round(mouth_notch_px)) if mouth_notch_enabled else 0
+    ring_r = max(1, inner_r - notch_px)
+
+    # fish-eye-aware unwrap: sample the annulus into a (radius x angle) image whose
+    # rows follow the lens's resolution (see _warp_radial_targets)
+    map_x, map_y, r_lut, theta_lut = build_warp_maps(
+        ccx, ccy, ring_r, outer_r, None, warp_ntheta)
+    warp_nr = len(r_lut)
+
+    # robot-frame bearing (deg, 0 = dwibbler-forward, cw+) of each unwrapped column
+    col_bearing = _cam_bearing(np.cos(theta_lut), np.sin(theta_lut))
+
+    # mouth notch mask: blank the rows inside the original inner_r everywhere except
+    # the wedge about the dwibbler
+    inner_blank = None
+    # where detect_dwibble_mark looks: exactly the wedge inner_blank leaves out of
+    # ball detection
+    notch_region = None
+    if notch_px:
+        notch_cols = np.abs(col_bearing) <= mouth_notch_half_deg
+        notch_rows = r_lut < inner_r
+        inner_blank = np.zeros((warp_nr, warp_ntheta), dtype=bool)
+        inner_blank[np.ix_(notch_rows, ~notch_cols)] = True
+        notch_region = np.zeros((warp_nr, warp_ntheta), dtype=bool)
+        notch_region[np.ix_(notch_rows, notch_cols)] = True
+
+    return (map_x, map_y, r_lut, theta_lut, col_bearing, inner_blank, notch_region,
+            inner_r, outer_r, ring_r)
 
 
-def _find_ball_columns(orange, n_theta, n_r):
+def _ball_candidates(mask, r_lut=None, n_theta=None):
+    """every blob in mask of at least min_orange_px pixels, as (cx, cy, x, y, w, h, area,
+    fill_ratio). area is a pixel count; fill_ratio is the share of the blob's minimum enclosing
+    circle it covers, with columns and rows scaled to the ball's expected width and height at
+    its row. The unwrap isn't square: past a metre a ball is 2 columns wide and 6 rows tall,
+    so an unscaled test would throw every far ball away. With no r_lut both axes count the
+    same, as in a plain image.
+    """
+    n, labels, stats, cents = cv2.connectedComponentsWithStats(mask, 8)
+    out = []
+    for k in range(1, n):
+        area = int(stats[k, cv2.CC_STAT_AREA])
+        if area < min_orange_px:
+            continue
+        x = int(stats[k, cv2.CC_STAT_LEFT])
+        y = int(stats[k, cv2.CC_STAT_TOP])
+        w = int(stats[k, cv2.CC_STAT_WIDTH])
+        h = int(stats[k, cv2.CC_STAT_HEIGHT])
+        cx, cy = cents[k]
+        sx, sy = (1.0, 1.0) if r_lut is None else _ball_cells_at(cy, r_lut, n_theta)
+        ys, xs = np.nonzero(labels[y:y + h, x:x + w] == k)
+        pts = np.column_stack((xs / sx, ys / sy)).astype(np.float32)
+        _c, enc_r = cv2.minEnclosingCircle(pts)
+        # the points are pixel centres, so add half a pixel's extent
+        enc_r += 0.5 * math.hypot(1.0 / sx, 1.0 / sy)
+        fill = (area / (sx * sy)) / (math.pi * enc_r * enc_r)
+        out.append((float(cx), float(cy), x, y, w, h, area, fill))
+    return out
+
+
+def _biggest_blob(mask, r_lut=None, n_theta=None):
+    """the biggest blob that passes ball_min_fill_ratio, as (col, row, w, h, area), or None."""
+    best = None
+    for cand in _ball_candidates(mask, r_lut, n_theta):
+        if cand[7] >= ball_min_fill_ratio and (best is None or cand[6] > best[6]):
+            best = cand
+    if best is None:
+        return None
+    cx, cy, _x, _y, w, h, area, _fill = best
+    return cx, cy, w, h, area
+
+
+def suggest_fill_ratio_threshold(samples):
+    """the ball_min_fill_ratio that best splits logged (is_ball, fill_ratio) samples, for
+    tests/fillratio_calib.py. Tries a cut halfway between each pair of neighbouring ratios,
+    keeps the one that sorts the most samples right, and on a tie the one with the most room
+    to its nearest sample. Returns (threshold, correct, total); threshold is None if every
+    sample is the same kind.
+    """
+    balls = sorted(r for is_ball, r in samples if is_ball)
+    decoys = sorted(r for is_ball, r in samples if not is_ball)
+    total = len(balls) + len(decoys)
+    if not balls or not decoys:
+        return None, 0, total
+
+    ratios = sorted(set(balls + decoys))
+    cuts = ([0.0] + [(ratios[i] + ratios[i + 1]) / 2.0 for i in range(len(ratios) - 1)]
+            + [1.0])
+    best_t, best_correct, best_margin = cuts[0], -1, -1.0
+    for t in cuts:
+        margins = [b - t for b in balls if b >= t] + [t - d for d in decoys if d < t]
+        correct = len(margins)
+        margin = min(margins, default=0.0)
+        if correct > best_correct or (correct == best_correct and margin > best_margin):
+            best_t, best_correct, best_margin = t, correct, margin
+    return round(best_t, 3), best_correct, total
+
+
+def _find_ball_columns(orange, n_theta, n_r, r_lut=None):
     """ball blob column/row (col, row) + box (w, h), or None."""
     global _ball_track_col
 
@@ -271,7 +376,7 @@ def _find_ball_columns(orange, n_theta, n_r):
         cols = (np.arange(_ball_track_col - H, _ball_track_col + H + 1)
                 % n_theta)
         sub = np.ascontiguousarray(orange[:, cols])
-        b = _biggest_blob(sub)
+        b = _biggest_blob(sub, r_lut, n_theta)
         if b is not None:
             cx, cy, w, h, _a = b
             # accept only a blob clear of both window edges; one touching an
@@ -288,7 +393,7 @@ def _find_ball_columns(orange, n_theta, n_r):
     # Full 360 scan, wrap-padded so a ball on the seam stays one blob.
     margin = n_theta // 8
     padded = np.hstack([orange[:, -margin:], orange, orange[:, :margin]])
-    b = _biggest_blob(padded)
+    b = _biggest_blob(padded, r_lut, n_theta)
     if b is None:
         _ball_track_col = None
         return None
@@ -399,12 +504,11 @@ def _subpixel_centre(hsv, s_raw, mask, col, row, w_box, h_box, lower, upper,
     return new_col, new_row
 
 
-def detect_ball_warp(frame, lower, upper, map_x, map_y, r_lut, theta_lut,
-                     col_bearing, inner_blank=None):
-    """detect the orange ball inside the unwrapped annulus produced by build_warp_maps()."""
-    n_r = len(r_lut)
-    n_theta = len(theta_lut)
-
+def _ball_mask(frame, lower, upper, map_x, map_y, col_bearing, inner_blank=None):
+    """unwrap frame and threshold it: (orange mask, unwrapped HSV, raw saturation), with the
+    robot body and handle wedges blanked. Shared with tests/fillratio_calib.py so the bench
+    tool sees the same mask as the robot.
+    """
     unwrapped = cv2.remap(frame, map_x, map_y, cv2.INTER_LINEAR)
     hsv = cv2.cvtColor(unwrapped, cv2.COLOR_BGR2HSV)
     # keep the saturation as it came off the sensor: the boost is right for finding
@@ -424,7 +528,18 @@ def detect_ball_warp(frame, lower, upper, map_x, map_y, r_lut, theta_lut,
             handle_cols = cols if handle_cols is None else (handle_cols | cols)
         orange[:, handle_cols] = 0
 
-    blob = _find_ball_columns(orange, n_theta, n_r)
+    return orange, hsv, s_raw
+
+
+def detect_ball_warp(frame, lower, upper, map_x, map_y, r_lut, theta_lut,
+                     col_bearing, inner_blank=None):
+    """detect the orange ball inside the unwrapped annulus produced by build_warp_maps()."""
+    n_r = len(r_lut)
+    n_theta = len(theta_lut)
+
+    orange, hsv, s_raw = _ball_mask(frame, lower, upper, map_x, map_y, col_bearing, inner_blank)
+
+    blob = _find_ball_columns(orange, n_theta, n_r, r_lut)
     if blob is None:
         return None, None, None, hsv
     col, row, w_box, h_box = blob
@@ -725,49 +840,18 @@ def _camera_thread(cap_res):
             print(f"[camera] could not lock AE/AWB ({e}), running auto, "
                   "expect the ball fix to drift with the lighting", flush=True)
 
-    # Annulus geometry in full cropped-frame pixels (centre = cropped centre).
-    crop_w = sensor_size[0] - crop_left - crop_right
-    crop_h = sensor_size[1] - crop_top - crop_bottom
-    ccx = crop_w // 2
-    ccy = crop_h // 2
-    max_r = min(crop_w, crop_h) // 2
-    inner_r = int(exclusion_inner_frac * max_r)
-    outer_r = int(exclusion_outer_frac * max_r)
-    # the unwrap starts at the notch depth so the mouth wedge gets sampled; outside
-    # the wedge those extra near rows are blanked again below (inner_blank)
-    notch_px = int(round(mouth_notch_px)) if mouth_notch_enabled else 0
-    ring_r = max(1, inner_r - notch_px)
-
-    # fish-eye-aware unwrap: sample the annulus into a (radius x angle) image whose
-    # rows follow the lens's resolution (see _warp_radial_targets)
-    map_x, map_y, r_lut, theta_lut = build_warp_maps(
-        ccx, ccy, ring_r, outer_r, None, warp_ntheta)
-    warp_nr = len(r_lut)
+    (map_x, map_y, r_lut, theta_lut, col_bearing, inner_blank, notch_region,
+     inner_r, outer_r, ring_r) = _ring_geometry()
+    warp_nr, notch_px = len(r_lut), int(round(mouth_notch_px)) if mouth_notch_enabled else 0
 
     # ground distance per row, from r_lut (the radial axis is deliberately not
     # uniform); used only for the startup log line
     gd = np.array([_fisheye_radius(float(r)) for r in r_lut], dtype=np.float32)
 
-    # robot-frame bearing (deg, 0 = dwibbler-forward, cw+) of each unwrapped column
-    col_bearing = _cam_bearing(np.cos(theta_lut), np.sin(theta_lut))
-
-    # mouth notch mask: blank the rows inside the original inner_r everywhere except
-    # the wedge about the dwibbler
-    inner_blank = None
-    # where detect_dwibble_mark looks: exactly the wedge inner_blank leaves out of
-    # ball detection
-    notch_region = None
     if notch_px:
         notch_cols = np.abs(col_bearing) <= mouth_notch_half_deg
-        notch_rows = r_lut < inner_r
-        inner_blank = np.zeros((warp_nr, warp_ntheta), dtype=bool)
-        inner_blank[np.ix_(notch_rows, ~notch_cols)] = True
-        notch_region = np.zeros((warp_nr, warp_ntheta), dtype=bool)
-        notch_region[np.ix_(notch_rows, notch_cols)] = True
         print(f"[camera] mouth notch: +-{mouth_notch_half_deg:.0f} deg, "
-              f"{notch_px} px ({_fisheye_radius(inner_r):.0f} -> "
-              f"{_fisheye_radius(ring_r):.0f} mm nearest visible), "
-              f"{int(notch_cols.sum())}/{warp_ntheta} columns", flush=True)
+              f"{notch_px} px, {int(notch_cols.sum())}/{warp_ntheta} columns", flush=True)
 
     _frame_times = []
     _printed_shape = False

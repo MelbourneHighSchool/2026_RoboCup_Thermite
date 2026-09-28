@@ -24,7 +24,7 @@ from bot.vision import (mouth_notch_enabled, mouth_notch_half_deg,
 import bot.vision as vision
 import bot.state as state
 import bot.motion as motion
-import bot.match_recorder as match_recorder
+import bot.debug_session as debug_session
 
 
 # Debug / field display
@@ -235,7 +235,7 @@ def render_field_panel(pose, ball, enemies=None, teammate_pos=None, lidar_hz=Non
     return img
 
 
-def render_dwibble_cam_panel(panel_h=None):
+def render_dwibble_cam_panel():
     """second-camera panel: the raw frame with the ball mask tinted, the ball blob (circle,
     dx/dy from centre, pixel radius), the calibrated distance once calib_points.json loads,
     and the frac readout. A placeholder while the camera thread hasn't published.
@@ -247,7 +247,6 @@ def render_dwibble_cam_panel(panel_h=None):
         frac = shared_state.get("dwibble_cam_frac")
         seen = shared_state.get("dwibble_cam_seen")
         ball = shared_state.get("dwibble_cam_ball")
-    ph = panel_h or default_panel_h
     if frame is None:
         img = np.zeros((240, 320, 3), dtype=np.uint8)
         cv2.putText(img, "dwibble cam: no frame", (8, 120),
@@ -370,7 +369,8 @@ img{display:block;max-width:100%;border:1px solid #444}h2{font-size:14px;margin:
 #fps{font-size:12px;color:#8f8;margin:4px 0}
 #dwcam{font-size:12px;color:#8cf;margin:4px 0;min-height:14px}
 #diag{font-size:12px;color:#fc6;margin:4px 0;min-height:14px}
-#slip{font-size:12px;color:#f66;margin:4px 0;min-height:14px}</style>
+#slip{font-size:12px;color:#f66;margin:4px 0;min-height:14px}
+#imu{font-size:12px;color:#ccc;margin:4px 0;min-height:14px}</style>
 </head><body>
 <h2>thermite &mdash; debug</h2>
 <img src="/stream.mjpg">
@@ -378,7 +378,8 @@ img{display:block;max-width:100%;border:1px solid #444}h2{font-size:14px;margin:
 <div id="dwcam">dwibble cam: -</div>
 <div id="diag"></div>
 <div id="slip"></div>
-<div id="rec"><button onclick="toggleRec()" id="recbtn">Record: off</button></div>
+<div id="imu">imu: -</div>
+<div id="rec"><button onclick="toggleRec()" id="recbtn">Debug recording: off</button></div>
 <script>
 function poll(){
   fetch("/status").then(r=>r.json()).then(d=>{
@@ -391,8 +392,9 @@ function poll(){
       `${c.frac === null || c.frac === undefined ? "--" : (+c.frac).toFixed(2)}   ` +
       `${c.seen ? "held" : "open"}`;
     const rb = document.getElementById("recbtn");
-    rb.textContent = "Record: " + (d.record_match ? "on" : "off");
-    rb.style.color = d.record_match ? "#f66" : "#ccc";
+    rb.textContent = "Debug recording: " + (d.debug_recording ? "on" : "off");
+    rb.style.color = d.debug_recording ? "#f66" : "#ccc";
+    rb.title = d.debug_folder || "";
     const diag = document.getElementById("diag");
     diag.textContent = (d.diag_findings && d.diag_age_s !== null && d.diag_age_s < 3)
       ? "[diag] " + d.diag_findings.join("  |  ") : "";
@@ -402,11 +404,14 @@ function poll(){
       ? `[slip] trust ${d.wheel_slip_trust.toFixed(2)}  `
         + `(wheel ${f(d.wheel_speed_mms)} mm/s vs lidar ${f(d.lidar_speed_mms)} mm/s)`
       : "";
+    document.getElementById("imu").textContent =
+      `imu: heading ${f(d.imu_heading)} deg   rate ${f(d.imu_yaw_rate_dps)} deg/s` +
+      (d.imu_gyro_rate_enabled ? " (gyro)" : " (differenced)");
   }).catch(()=>{});
 }
 function toggleRec(){
   const on = document.getElementById("recbtn").textContent.includes("off");
-  fetch("/set_record",{method:"post",headers:{"Content-Type":"application/json"},
+  fetch("/set_debug_recording",{method:"post",headers:{"Content-Type":"application/json"},
         body:JSON.stringify({on:on}))
     .then(()=>poll());
 }
@@ -630,7 +635,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 dw_cam_seen = shared_state.get("dwibble_cam_seen")
                 dw_cam_frame = shared_state.get("dwibble_cam_frame") is not None
                 dw_cam_ball = shared_state.get("dwibble_cam_ball")
-                recording = match_recorder.record_match
+                imu_heading = shared_state.get("imu_heading")
+                imu_yaw_rate_dps = shared_state.get("imu_yaw_rate_dps")
+                recording = debug_session.recording
+                sess = debug_session._session
+                debug_folder = sess.folder if sess is not None else None
             now = time.monotonic()
             body = json.dumps({
                 "loop_hz": shared_state.get("loop_hz"),
@@ -648,8 +657,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "r": dw_cam_ball[2], "dist_mm": dw_cam_ball[3],
                     }),
                 },
-                # Match replay recording: current toggle state (flippable via /set_record).
-                "record_match": recording,
+                # debug session recording and its folder
+                "debug_recording": recording,
+                "debug_folder": debug_folder,
+                # IMU heading and gyroscope rate, for checking the rate's sign by hand
+                "imu_heading": imu_heading,
+                "imu_yaw_rate_dps": imu_yaw_rate_dps,
+                "imu_gyro_rate_enabled": motion.imu_gyro_rate_enabled,
                 "diag_findings": diag_findings,
                 "diag_age_s": (None if diag_last_t is None
                                   else now - diag_last_t),
@@ -752,10 +766,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             motion.reset_gate_calibration_counters()
             self.send_bytes(b"ok", "text/plain")
 
-        elif self.path == "/set_record":
-            # Toggle match replay recording live (bot/match_recorder.py): {"on": true/false}.
+        elif self.path == "/set_debug_recording":
+            # pause or resume the debug session (bot/debug_session.py): {"on": true/false}
             on = bool(body.get("on"))
-            match_recorder.set_record(on)
+            debug_session.set_recording(on)
             self.send_bytes(b"ok", "text/plain")
 
         else:

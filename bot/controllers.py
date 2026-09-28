@@ -29,7 +29,7 @@ from bot.motion import (
     _sideline_route_point,
     _slew_drive, _teammate_guard, _turn_about_ball, _wall_guard, capture_cone_half_deg,
     capture_cone_half_width_mm, enemy_contest_dist_mm, flick_range_mm, goalie_max_frac,
-    pass_eject_frac, pass_race_margin_s, pass_reach_mm,
+    pass_eject_frac, pass_reach_mm,
     recovery_lateral_mm, recovery_standoff_mm,
     sideline_route_slow_mm,
     wall_safe_speed_cmd,
@@ -43,7 +43,7 @@ from bot.tracking import (
 )
 
 # field calibration: the measured goal centres, if a calibration was saved
-from bot.calibration import calib as _calib, goal_positions as _goal_positions
+from bot.calibration import goal_positions as _goal_positions
 
 
 # Behaviour states (bot/network.py's master also reads these names).

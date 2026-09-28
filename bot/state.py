@@ -61,6 +61,10 @@ _state = {
     "dwibble_cam_seen": False,
     "dwibble_cam_frac": 0.0,
     "imu_heading": None, # BNO08x yaw (relative, deg cw+) or None
+    # gyroscope yaw rate (deg/s, cw+) and when it was read; used only with
+    # motion.imu_gyro_rate_enabled
+    "imu_yaw_rate_dps": None,
+    "imu_yaw_rate_t": None,
     # monotonic time of the last COLLISION_ACCEL_G spike, WheelOdometry's contact gate
     "collision_t": None,
     # True once there has been no good BNO08x reading for imu_fault_hold_s straight;
@@ -114,9 +118,9 @@ _state = {
     # set on a real side change so the lidar thread re-searches instead of coasting on
     # a pose fitted against the old side
     "force_relocalise": False,
-    # mirror of match_recorder.record_match for the debug page; the module flag is the
+    # mirror of debug_session.recording for the debug page; the module flag is the
     # source of truth
-    "record_match": False,
+    "debug_recording": False,
 }
 
 mode = "run" # "run" | "hsv"

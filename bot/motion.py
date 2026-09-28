@@ -12,7 +12,7 @@ import bot.state as state
 from bot.field import FieldModel, wrap_deg as _wrap_deg
 from bot.hardware import Motor
 from bot.perception import Perception
-from bot.drive_config import base_speed, rush_speed, wall_slide_zone_mm
+from bot.drive_config import base_speed, wall_slide_zone_mm
 
 # flick range, shared with the drive-speed model below
 flick_range_mm = 900.0
@@ -294,14 +294,26 @@ imu_rate_max_gap_s = 0.2
 _imu_rate_prev = None # (heading_deg, monotonic_t) of the previous sample pair member
 _imu_rate_cache = None # (monotonic_t, rate_dps): this tick's derived rate
 
+# Take the rate from the gyroscope report (state "imu_yaw_rate_dps") instead of differencing
+# headings: less lag and less noise. Off until the sign is checked by hand on the robot (see
+# BENCH_TEST_CHECKLIST.md): with the sign wrong the D term pushes the turn instead of damping
+# it. Stale readings count as no rate, same as the differenced path.
+imu_gyro_rate_enabled = False
+
 
 def _imu_yaw_rate_dps():
-    """body yaw rate (deg/s, cw+) from consecutive imu_heading samples, or 0.0 with no usable
-    pair (no compass, a sample inside the minimum gap or older than the maximum, or an
-    unmoved reading).
+    """body yaw rate (deg/s, cw+), from the gyroscope with imu_gyro_rate_enabled, otherwise
+    from consecutive imu_heading samples. 0.0 when there's no usable reading.
     """
     global _imu_rate_prev, _imu_rate_cache
     now = time.monotonic()
+    if imu_gyro_rate_enabled:
+        with state._lock:
+            rate = state._state["imu_yaw_rate_dps"]
+            t = state._state["imu_yaw_rate_t"]
+        if rate is None or t is None or now - t > imu_rate_max_gap_s:
+            return 0.0
+        return float(rate)
     prev = _imu_rate_prev
     if prev is not None and now - prev[1] < imu_rate_min_gap_s:
         # a later call in the same control tick reuses this tick's rate

@@ -35,7 +35,7 @@ from bot.vision import _camera_thread, _init_hsv, sensor_size
 # likewise vision._enemy_goal_colour, set here and read by the camera thread and camrun.
 import bot.controllers as controllers
 import bot.drive_config as drive_config
-import bot.match_recorder as match_recorder
+import bot.debug_session as debug_session
 import bot.network as network
 import bot.odometry as odometry
 import bot.state as state
@@ -119,6 +119,8 @@ def play_loop():
                         shared_state["run_mode"] = "idle"
                 Motor.stopall()
                 _set_dwibbler(False)
+                # keep recording through the stop, it's worth watching back
+                debug_session.record_tick()
                 time.sleep(loop_dt)
                 continue
             was_imu_pause_latched = False
@@ -148,9 +150,9 @@ def play_loop():
                 Motor.stopall()
                 _set_dwibbler(False)
 
-            # match replay recording: one snapshot per tick while record_match
-            # is on, a single flag check otherwise
-            match_recorder.record_tick()
+            # debug session recording: one snapshot per tick while it is on, a single
+            # flag check otherwise
+            debug_session.record_tick()
 
             now = time.monotonic()
             tick_times.append(now)
@@ -161,7 +163,7 @@ def play_loop():
             time.sleep(loop_dt)
     except KeyboardInterrupt:
         print("\n[main] stopped.")
-        match_recorder.finish()
+        debug_session.finish()
         Motor.stopall()
         time.sleep(0.2)
         Motor.clear_faults()
@@ -176,10 +178,10 @@ def handle_sigterm(signum, frame):
     Motor.stopall()
     time.sleep(0.2)
     Motor.clear_faults()
-    match_recorder.finish()
     _finish_lidar_log()
     _finish_capture_log()
     _finish_motion_log()
+    debug_session.finish()
     sys.exit(0)
 
 
@@ -196,14 +198,14 @@ def main():
                     help="skip the brief motor boot self-test")
     ap.add_argument("--lidarlog", nargs="?", type=float, const=60.0,
                     default=None, metavar="seconds",
-                    help="log lidar localisation to logs/lidar_*.txt for "
+                    help="log lidar localisation to lidar.txt in the debug session for "
                          "seconds (default 60), then stop logging and carry "
                          "on running. Park the robot first, with it parked, "
                          "every mm of pose movement in the log is error.")
     ap.add_argument("--capturelog", nargs="?", type=float, const=60.0,
                     default=None, metavar="seconds",
                     help="log bot/ball position+velocity and the yellow-zone "
-                         "PD's measures to logs/capture_*.txt for "
+                         "PD's measures to capture.txt in the debug session for "
                          "seconds (default 60), then stop logging and carry "
                          "on running. Play normally, unlike --lidarlog this "
                          "one wants the robot actually chasing the ball.")
@@ -211,7 +213,7 @@ def main():
                     default=None, metavar="seconds",
                     help="log the capture-zone PD's internals, the "
                          "resulting per-motor commands, and measured pose/"
-                         "IMU/QDR telemetry to logs/motion_*.txt for "
+                         "IMU/QDR telemetry to motion.txt in the debug session for "
                          "seconds (default 60) at motionlog_hz. Play "
                          "normally, see motion_debug.py.")
     ap.add_argument("--kickoff", choices=("kicking", "receiving"),
@@ -222,11 +224,12 @@ def main():
                          "in/behind the box). The hold runs kickoff_hold_s "
                          "from play start, or ends early once the ball moves "
                          "toward us. Omit for no kickoff hold.")
-    ap.add_argument("--record", action="store_true",
-                    help="record the match for replay: one snapshot per "
-                         "control tick (pose, ball, enemies, FSM, motor "
-                         "commands) to logs/match_*.jsonl. Also toggleable "
-                         "live via the debug page or RECORD_MATCH=1.")
+    ap.add_argument("--debug", action="store_true",
+                    help="record this power-on as a debug session in "
+                         "logs/debug_r<id>_<time>/: every control tick (pose, "
+                         "ball, enemies, state, motor commands), for "
+                         "simulator.py. Also DEBUG_SESSION=1 or the switch on "
+                         "the debug page.")
     args = ap.parse_args()
     # which side of the kick-off we're on is an operator fact the robot can't sense
     kickoff_side = args.kickoff
@@ -236,8 +239,8 @@ def main():
     # --lidarlog: opened before any thread starts, so scan 1 is captured. The lidar
     # thread closes it when the duration is up and play carries on normally.
     if args.lidarlog is not None:
-        from bot.lidar_debug import LidarLogger, new_session_path
-        state._lidar_log = LidarLogger(new_session_path(),
+        from bot.lidar_debug import LidarLogger
+        state._lidar_log = LidarLogger(debug_session.path("lidar.txt"),
                                        duration_s=args.lidarlog)
         state._lidar_log.header(_lidar_log_consts())
         print(f"[lidarlog] logging {args.lidarlog:.0f}s to {state._lidar_log.path}, "
@@ -245,8 +248,8 @@ def main():
 
     # --capturelog: same shape, closed by StrikerController.tick()
     if args.capturelog is not None:
-        from bot.capture_debug import CaptureLogger, new_session_path as new_capture_path
-        state._capture_log = CaptureLogger(new_capture_path(),
+        from bot.capture_debug import CaptureLogger
+        state._capture_log = CaptureLogger(debug_session.path("capture.txt"),
                                            duration_s=args.capturelog)
         state._capture_log.header(_capture_log_consts())
         print(f"[capturelog] logging {args.capturelog:.0f}s to "
@@ -255,18 +258,18 @@ def main():
     # --motionlog: opened here (a no-op in hsv mode); its poll thread starts once the
     # motors are up
     if args.motionlog is not None:
-        from bot.motion_debug import MotionLogger, new_session_path as new_motion_path
-        state._motion_log = MotionLogger(new_motion_path(),
+        from bot.motion_debug import MotionLogger
+        state._motion_log = MotionLogger(debug_session.path("motion.txt"),
                                          duration_s=args.motionlog)
         state._motion_log.header(_motion_log_consts())
         print(f"[motionlog] logging {args.motionlog:.0f}s to "
               f"{state._motion_log.path}, play normally", flush=True)
 
     state.mode = "hsv" if args.hsv else "run"
-    # Match replay recording: --record flag, or RECORD_MATCH env var (set it
-    # in systemd's Environment= to always record competition matches).
-    if args.record or os.environ.get("RECORD_MATCH", "") == "1":
-        match_recorder.set_record(True)
+    # Debug session: --debug, or DEBUG_SESSION=1 (set it in systemd's Environment= to
+    # record every match). One session per power-on.
+    if args.debug or os.environ.get("DEBUG_SESSION", "") == "1":
+        debug_session.set_recording(True)
     # goal colour and role are both picked live at the field with the mode buttons
     cap_res = sensor_size
 

@@ -24,13 +24,15 @@ class Compass:
         import board
         from adafruit_bno08x.i2c import BNO08X_I2C
         from adafruit_bno08x import (BNO_REPORT_GAME_ROTATION_VECTOR,
-                                     BNO_REPORT_LINEAR_ACCELERATION)
+                                     BNO_REPORT_LINEAR_ACCELERATION,
+                                     BNO_REPORT_GYROSCOPE)
 
         self.address = address
         self.bno = BNO08X_I2C(board.I2C(), address=address)
         time.sleep(0.1)
         self.bno.enable_feature(BNO_REPORT_GAME_ROTATION_VECTOR)
         self.bno.enable_feature(BNO_REPORT_LINEAR_ACCELERATION)
+        self.bno.enable_feature(BNO_REPORT_GYROSCOPE)
         time.sleep(0.1)
 
     @classmethod
@@ -56,6 +58,14 @@ class Compass:
         """linear acceleration magnitude, m/s^2, gravity already removed by the chip."""
         ax, ay, az = self.bno.linear_acceleration
         return math.sqrt(ax * ax + ay * ay + az * az)
+
+    def read_gyro_rate(self):
+        """yaw rate from the gyroscope report, deg/s, cw+ like read(). Gyro and quaternion
+        share a body frame, so it gets the same negation; the sign still needs checking by
+        hand on the robot (see motion.imu_gyro_rate_enabled).
+        """
+        _gx, _gy, gz = self.bno.gyro
+        return -math.degrees(gz) # ccw+ -> cw+, as in read()
 
 # Fold the IMU heading delta into each scan's localisation prior. The compass thread
 # publishes imu_heading for telemetry either way.
@@ -129,6 +139,50 @@ def _imu_turn_between(t0, t1):
 COLLISION_ACCEL_G = 14.0
 
 
+def _compass_poll(c, fail_since):
+    """one poll: read, publish what worked, and return fail_since (when the current run of
+    bad reads started, or None). Separate from the loop so tests can call it directly.
+    """
+    try:
+        h = c.read()
+        accel = c.read_accel()
+    except Exception: # transient bus error, hold last value
+        h = accel = None
+    try:
+        # separate, so a bad gyro read doesn't lose the heading
+        rate = c.read_gyro_rate()
+    except Exception:
+        rate = None
+    now = time.monotonic()
+    if h is not None:
+        with state._lock:
+            state._state["imu_heading"] = h
+            # a failed gyro read leaves the old rate, which then goes stale
+            if rate is not None:
+                state._state["imu_yaw_rate_dps"] = rate
+                state._state["imu_yaw_rate_t"] = now
+            # history for deskewing a revolution against the rotation
+            # that actually happened during it
+            _imu_hist.append((now, h))
+            while _imu_hist and now - _imu_hist[0][0] > imu_hist_s:
+                _imu_hist.popleft()
+        _mark_health_t("imu", now)
+        fail_since = None
+    elif fail_since is None:
+        fail_since = now
+    if accel is not None and accel > COLLISION_ACCEL_G * 9.80665:
+        with state._lock:
+            state._state["collision_t"] = now
+
+    faulted = fail_since is not None and (now - fail_since) >= imu_fault_hold_s
+    with state._lock:
+        state._state["imu_fault"] = faulted
+        if faulted:
+            state._state["imu_pause_latched"] = True
+    _report_health("imu", "fault (no reading)" if faulted else "ok")
+    return fail_since
+
+
 def _compass_thread():
     """poll the BNO08x at about 100 Hz into imu_heading and collision_t, and own the IMU fault
     latch.
@@ -144,32 +198,5 @@ def _compass_thread():
         return
     fail_since = None # monotonic time the current run of bad reads started, or None
     while True:
-        try:
-            h = c.read()
-            accel = c.read_accel()
-        except Exception: # transient bus error, hold last value
-            h = accel = None
-        now = time.monotonic()
-        if h is not None:
-            with state._lock:
-                state._state["imu_heading"] = h
-                # history for deskewing a revolution against the rotation
-                # that actually happened during it
-                _imu_hist.append((now, h))
-                while _imu_hist and now - _imu_hist[0][0] > imu_hist_s:
-                    _imu_hist.popleft()
-            _mark_health_t("imu", now)
-            fail_since = None
-        elif fail_since is None:
-            fail_since = now
-        if accel is not None and accel > COLLISION_ACCEL_G * 9.80665:
-            with state._lock:
-                state._state["collision_t"] = now
-
-        faulted = fail_since is not None and (now - fail_since) >= imu_fault_hold_s
-        with state._lock:
-            state._state["imu_fault"] = faulted
-            if faulted:
-                state._state["imu_pause_latched"] = True
-        _report_health("imu", "fault (no reading)" if faulted else "ok")
+        fail_since = _compass_poll(c, fail_since)
         time.sleep(0.01)

@@ -36,7 +36,7 @@ class Motor:
 
     # async flush thread (opt-in via start_async)
     _async = False # when True, spee-via-drive is staged, not written
-    _targets = {} # name -> staged command (int)
+    _targets = {} # name -> staged command, a fraction of full speed
     _last_sent = {} # name -> last command actually written
     _stage_lock = threading.Lock()
     FLUSH_PERIOD_S = 0.002

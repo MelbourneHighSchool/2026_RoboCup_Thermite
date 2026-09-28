@@ -4,7 +4,7 @@
 #     python3 -m bot.main --lidarlog # log 60 s, then stop
 #     python3 -m bot.main --lidarlog 120 # log 120 s
 #
-# One plain-text file per run at logs/lidar_YYYYmmdd_HHMMSS.txt. The point
+# One plain-text file per run, lidar.txt in the debug session folder. The point
 # is to answer "why does the pose jitter" from the log alone, so every scan
 # records what went into the ICP (the prior, and where it came from) as well
 # as what came out, plus the raw polar returns every raw_every scans. A
@@ -385,7 +385,7 @@ class LidarLogger:
         src_n = {}
         for s in self._skew:
             src_n[s[5]] = src_n.get(s[5], 0) + 1
-        out.append(f"[sum]   deskew rotation source: " +
+        out.append("[sum]   deskew rotation source: " +
                    (" ".join(f"{k}={v}" for k, v in sorted(src_n.items()))
                     or "none"))
         if errs:
@@ -463,9 +463,3 @@ def _unwrap(hs):
     for h in hs[1:]:
         out.append(out[-1] + _wrap(h - out[-1]))
     return out
-
-
-def new_session_path(directory="logs"):
-    """logs/lidar_YYYYmmdd_HHMMSS.txt, one file per run, never overwritten."""
-    return os.path.join(directory,
-                        time.strftime("lidar_%Y%m%d_%H%M%S.txt"))
